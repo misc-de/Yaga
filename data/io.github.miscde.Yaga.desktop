@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Yaga
+Comment=Browse photos and videos
+Exec=python3 -m yaga
+Icon=org.gnome.Photos
+Terminal=false
+Categories=GNOME;GTK;Graphics;Photography;
+StartupNotify=true
+
