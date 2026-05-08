@@ -1103,15 +1103,14 @@ class GalleryWindow(Adw.ApplicationWindow):
         if scroller_width <= 0:
             return
         columns = min(max(int(self.settings.grid_columns), 2), 10)
-        # Each cell has 1px padding on each side → 2px per cell
-        cell_size = max(32, scroller_width // columns)
-        # Set both min AND max height to keep tiles square and fixed size
+        # Margins: 1px on each side per tile = 2px per tile
+        cell_size = max(32, (scroller_width - columns * 2) // columns)
+        # Only set height: the homogeneous Box distributes width automatically,
+        # so min/max-width here would create a measurement feedback loop.
         self._tile_css.load_from_data(
             f""".gallery-tile {{
                 min-height: {cell_size}px;
                 max-height: {cell_size}px;
-                min-width: {cell_size}px;
-                max-width: {cell_size}px;
             }}""".encode()
         )
 
