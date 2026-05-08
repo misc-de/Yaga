@@ -842,14 +842,17 @@ class GalleryWindow(Adw.ApplicationWindow):
             .gallery-tile > * {
                 margin: 0;
             }
-            listview.gallery-list > row {
+            listview.gallery-grid > row {
                 padding: 0;
             }
-            listview.gallery-list > row:hover,
-            listview.gallery-list > row:selected {
+            listview.gallery-grid > row:hover,
+            listview.gallery-grid > row:selected {
                 background: transparent;
             }
-            .date-section-header {
+            gridview.gallery-grid > child {
+                padding: 1px;
+            }
+            .date-header {
                 min-height: 30px;
                 padding: 0 4px;
                 background: rgba(0,0,0,0.45);

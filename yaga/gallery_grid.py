@@ -78,6 +78,16 @@ class GalleryRow(GObject.Object):
         return row
 
 
+class _GalleryListView(Gtk.ListView):
+    """ListView that exposes the GridView column-count API for interface compatibility."""
+
+    def set_min_columns(self, _n: int) -> None:
+        pass
+
+    def set_max_columns(self, _n: int) -> None:
+        pass
+
+
 class GalleryGrid(Gtk.Overlay):
     def __init__(self, owner: "GalleryWindow") -> None:
         super().__init__()
@@ -94,19 +104,19 @@ class GalleryGrid(Gtk.Overlay):
         factory.connect("bind", self._on_item_bind)
         factory.connect("unbind", self._on_item_unbind)
 
-        self.list_view = Gtk.ListView()
-        self.list_view.set_model(Gtk.NoSelection(model=self.row_store))
-        self.list_view.set_factory(factory)
-        self.list_view.add_css_class("gallery-list")
-        self.list_view.set_hexpand(True)
-        self.list_view.set_vexpand(True)
-        self.list_view.set_show_separators(False)
+        self.grid_view = _GalleryListView()
+        self.grid_view.set_model(Gtk.NoSelection(model=self.row_store))
+        self.grid_view.set_factory(factory)
+        self.grid_view.add_css_class("gallery-grid")
+        self.grid_view.set_hexpand(True)
+        self.grid_view.set_vexpand(True)
+        self.grid_view.set_show_separators(False)
 
         self.scroller = Gtk.ScrolledWindow()
         self.scroller.set_hexpand(True)
         self.scroller.set_vexpand(True)
         self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.scroller.set_child(self.list_view)
+        self.scroller.set_child(self.grid_view)
 
         self.empty_label = Gtk.Label()
         self.empty_label.set_halign(Gtk.Align.CENTER)
@@ -141,6 +151,8 @@ class GalleryGrid(Gtk.Overlay):
 
     def set_columns(self, columns: int) -> None:
         self._cols = min(max(int(columns), 2), _MAX_COLS)
+        self.grid_view.set_min_columns(columns)
+        self.grid_view.set_max_columns(columns)
 
     def clear(self) -> None:
         self.row_store.remove_all()
@@ -178,13 +190,11 @@ class GalleryGrid(Gtk.Overlay):
             gallery_row = self.row_store.get_item(pos)
             if gallery_row.is_header:
                 continue
-            for j, tile in enumerate(gallery_row.tiles):
-                if not tile.is_folder and tile.media_item and tile.media_item.path == path:
+            for j, row in enumerate(gallery_row.tiles):
+                if not row.is_folder and row.media_item and row.media_item.path == path:
                     new_tiles = gallery_row.tiles[:]
-                    new_tiles[j] = MediaRow.from_media(
-                        dataclasses.replace(tile.media_item, thumb_path=thumb_path),
-                        tile.selected,
-                    )
+                    updated = dataclasses.replace(row.media_item, thumb_path=thumb_path)
+                    new_tiles[j] = MediaRow.from_media(updated, row.selected)
                     self.row_store.splice(pos, 1, [GalleryRow.from_tiles(new_tiles)])
                     return True
         return False
@@ -224,7 +234,7 @@ class GalleryGrid(Gtk.Overlay):
         header_lbl.set_xalign(0.0)
         header_lbl.set_hexpand(True)
         header_lbl.set_margin_start(10)
-        header_lbl.add_css_class("date-section-header")
+        header_lbl.add_css_class("date-header")
 
         # ── Tile row widget ──────────────────────────────────────────
         tile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
