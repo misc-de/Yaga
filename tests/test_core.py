@@ -249,6 +249,8 @@ def test_nextcloud_folder_open_only_syncs_folder_thumbnails() -> None:
     assert "_nc_folder_sync_generation" in source
     assert "MediaRow.from_media(updated, row.selected)" in grid_source
     assert "return True" in grid_source
+    assert "get_media_by_path" in source
+    assert "update_folder_thumb" in grid_source
 
 
 def test_gallery_grid_is_split_out_of_app_module() -> None:
@@ -268,11 +270,11 @@ def test_viewer_has_close_header_but_no_navigation_buttons() -> None:
     assert "header.set_show_start_title_buttons(False)" in viewer_source
     assert "header.set_show_end_title_buttons(False)" in viewer_source
     assert "window-close-symbolic" in viewer_source
-    assert "header.pack_start(self.close_button)" in viewer_source
     assert "header.pack_start(self.delete_button)" in viewer_source
-    assert "header.pack_end(self.info_button)" in viewer_source
-    assert "header.pack_end(self.edit_button)" in viewer_source
+    assert "header.pack_start(self.info_button)" in viewer_source
     assert "header.pack_end(self.rotate_button)" in viewer_source
+    assert "header.pack_end(self.edit_button)" in viewer_source
+    assert "header.pack_end(self.close_button)" in viewer_source
     assert "go-previous-symbolic" not in viewer_source
     assert "go-next-symbolic" not in viewer_source
     assert "Gtk.GestureSwipe()" in viewer_source
@@ -286,6 +288,7 @@ def test_viewer_has_close_header_but_no_navigation_buttons() -> None:
     assert 'self.zoom_gesture.connect("scale-changed", self._on_zoom_scale_changed)' in viewer_source
     assert 'self.click_gesture.connect("pressed", self._on_viewer_pressed)' in viewer_source
     assert "def _navigate_from_horizontal_motion" in viewer_source
+    assert "abs(x) <= abs(y) * 1.8" in viewer_source
 
 
 def test_viewer_exposes_info_edit_and_delete_actions() -> None:
@@ -313,6 +316,43 @@ def test_viewer_disables_own_gestures_in_editor_mode() -> None:
     assert "Gtk.PropagationPhase.NONE" in viewer_source
     assert "self._set_view_gestures_enabled(False)" in viewer_source
     assert "self._set_view_gestures_enabled(True)" in viewer_source
+
+
+def test_navigation_uses_spinner_broken_icon_and_pull_refresh() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    config_source = Path("yaga/config.py").read_text(encoding="utf-8")
+
+    assert "DEBUG_LOG_PATH" in config_source
+    assert "RotatingFileHandler(DEBUG_LOG_PATH" in app_source
+    assert "header.pack_start(self.refresh_button)" not in app_source
+    assert "Gtk.EventControllerScrollFlags.VERTICAL" in app_source
+    assert "def _on_pull_refresh_scroll" in app_source
+    assert "Gtk.Spinner()" in app_source
+    assert "network-error-symbolic" in app_source
+    assert "set_pixel_size(22)" in app_source
+    assert "spinner.set_valign(Gtk.Align.START)" in app_source
+    assert "self._nc_broken_img.set_visible(active)" in app_source
+
+
+def test_settings_search_is_disabled() -> None:
+    settings_source = Path("yaga/settings_window.py").read_text(encoding="utf-8")
+
+    assert "self.set_search_enabled(False)" in settings_source
+
+
+def test_gallery_supports_date_group_sorting_headers() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
+
+    assert '("date", "Date", "view-calendar-symbolic")' in app_source
+    assert "def _render_date_groups" in app_source
+    assert "def _date_group_label" in app_source
+    assert 'order = ["day", "week", "month", "year"]' in app_source
+    assert "self.gallery_grid.append_header(header)" in app_source
+    assert "def append_header" in grid_source
+    assert "class MediaRow" in grid_source
+    assert "header_text" in grid_source
+    assert "date-header" in app_source
 
 
 def test_viewer_supports_pinch_zoom_and_double_tap_reset() -> None:
@@ -372,6 +412,18 @@ def test_editor_frames_are_decorative_not_plain_color_bands() -> None:
     assert "_decorate_christmas" in source
     assert "_decorate_winter" in source
     assert len(_FRAME_THEMES) >= 8
+
+
+def test_editor_has_resettable_sliders_color_picker_and_multiple_stickers() -> None:
+    source = Path("yaga/editor.py").read_text(encoding="utf-8")
+
+    assert 'Gtk.Button.new_from_icon_name("edit-undo-symbolic")' in source
+    assert "def _reset_slider" in source
+    assert "Gtk.ColorButton.new_with_rgba" in source
+    assert "def _on_text_color_set" in source
+    assert "self._stickers: list[dict]" in source
+    assert "self._stickers.append" in source
+    assert "for sticker in self._stickers" in source
 
 
 def test_settings_window_is_split_out_of_app_module() -> None:

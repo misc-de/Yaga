@@ -28,6 +28,7 @@ class MediaRow(GObject.Object):
         self.folder_path: str | None = None
         self.folder_count: int = 0
         self.folder_thumbs: list[str] = []
+        self.header_text: str | None = None
         self.selected: bool = False
 
     @classmethod
@@ -45,9 +46,19 @@ class MediaRow(GObject.Object):
         row.folder_thumbs = thumbs
         return row
 
+    @classmethod
+    def from_header(cls, text: str) -> "MediaRow":
+        row = cls()
+        row.header_text = text
+        return row
+
     @property
     def is_folder(self) -> bool:
         return self.folder_path is not None
+
+    @property
+    def is_header(self) -> bool:
+        return self.header_text is not None
 
 
 class GalleryGrid(Gtk.Overlay):
@@ -101,6 +112,9 @@ class GalleryGrid(Gtk.Overlay):
     def append_media(self, item: MediaItem, selected: bool = False) -> None:
         self.item_store.append(MediaRow.from_media(item, selected))
 
+    def append_header(self, text: str) -> None:
+        self.item_store.append(MediaRow.from_header(text))
+
     def set_empty(self, text: str, visible: bool) -> None:
         self.empty_label.set_label(text)
         self.empty_label.set_visible(visible)
@@ -115,6 +129,16 @@ class GalleryGrid(Gtk.Overlay):
             if not row.is_folder and row.media_item and row.media_item.path == path:
                 updated = dataclasses.replace(row.media_item, thumb_path=thumb_path)
                 self.item_store.splice(pos, 1, [MediaRow.from_media(updated, row.selected)])
+                return True
+        return False
+
+    def update_folder_thumb(self, folder_path: str, thumb_path: str) -> bool:
+        n = self.item_store.get_n_items()
+        for pos in range(n):
+            row = self.item_store.get_item(pos)
+            if row.is_folder and row.folder_path == folder_path:
+                thumbs = [thumb_path, *[thumb for thumb in row.folder_thumbs if thumb != thumb_path]][:4]
+                self.item_store.splice(pos, 1, [MediaRow.from_folder(row.folder_path, row.folder_count, thumbs)])
                 return True
         return False
 
@@ -184,6 +208,7 @@ class GalleryGrid(Gtk.Overlay):
         button._badge = badge                  # type: ignore[attr-defined]
         button._folder_label = folder_label    # type: ignore[attr-defined]
         button._check = check                  # type: ignore[attr-defined]
+        button._overlay = overlay              # type: ignore[attr-defined]
 
         button.connect("clicked", self._on_tile_clicked, list_item)
 
@@ -212,6 +237,24 @@ class GalleryGrid(Gtk.Overlay):
         folder_label: Gtk.Label = button._folder_label
         check: Gtk.Image = button._check
         icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+
+        if row.is_header:
+            single_pic.set_visible(False)
+            pic_grid.set_visible(False)
+            badge.set_visible(False)
+            check.set_visible(False)
+            folder_label.set_label(row.header_text or "")
+            folder_label.set_halign(Gtk.Align.START)
+            folder_label.set_valign(Gtk.Align.CENTER)
+            folder_label.set_visible(True)
+            button.set_sensitive(False)
+            button.add_css_class("date-header")
+            return
+
+        button.set_sensitive(True)
+        button.remove_css_class("date-header")
+        folder_label.set_halign(Gtk.Align.FILL)
+        folder_label.set_valign(Gtk.Align.END)
 
         if row.is_folder:
             valid_thumbs = [t for t in row.folder_thumbs if t and Path(t).exists()]
@@ -280,7 +323,7 @@ class GalleryGrid(Gtk.Overlay):
 
     def _on_tile_clicked(self, _button: Gtk.Button, list_item: Gtk.ListItem) -> None:
         row: MediaRow | None = list_item.get_item()
-        if row is None:
+        if row is None or row.is_header:
             return
         if self.owner._selection_mode:
             if not row.is_folder and row.media_item is not None:
@@ -300,13 +343,13 @@ class GalleryGrid(Gtk.Overlay):
         list_item: Gtk.ListItem,
     ) -> None:
         row: MediaRow | None = list_item.get_item()
-        if row is None or row.is_folder:
+        if row is None or row.is_folder or row.is_header:
             return
         self.owner._show_context_menu(gesture, 1, x, y, row.media_item, list_item.get_child())
 
     def _on_tile_long_press(self, _gesture, _x, _y, list_item: Gtk.ListItem) -> None:
         row: MediaRow | None = list_item.get_item()
-        if row is None or row.is_folder or row.media_item is None:
+        if row is None or row.is_folder or row.is_header or row.media_item is None:
             return
         if not self.owner._selection_mode:
             self.owner._enter_selection_mode()

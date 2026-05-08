@@ -63,11 +63,6 @@ class ViewerWindow(Adw.ApplicationWindow):
         header.set_show_start_title_buttons(False)
         header.set_show_end_title_buttons(False)
 
-        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
-        self.close_button.set_tooltip_text(parent._("Close"))
-        self.close_button.connect("clicked", lambda _button: self.close())
-        header.pack_start(self.close_button)
-
         self.delete_button = Gtk.Button.new_from_icon_name("user-trash-symbolic")
         self.delete_button.set_tooltip_text(parent._("Delete"))
         self.delete_button.add_css_class("destructive-action")
@@ -79,7 +74,13 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.info_button.set_tooltip_text(parent._("Info"))
         self.info_button.connect("clicked", self._show_info)
         self.info_button.set_visible(False)
-        header.pack_end(self.info_button)
+        header.pack_start(self.info_button)
+
+        self.rotate_button = Gtk.Button.new_from_icon_name("object-rotate-right-symbolic")
+        self.rotate_button.set_tooltip_text(parent._("Rotate clockwise"))
+        self.rotate_button.set_visible(False)
+        self.rotate_button.connect("clicked", self._rotate_clockwise)
+        header.pack_end(self.rotate_button)
 
         self.edit_button = Gtk.Button.new_from_icon_name("document-edit-symbolic")
         self.edit_button.set_tooltip_text(parent._("Edit"))
@@ -87,11 +88,10 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.edit_button.set_visible(False)
         header.pack_end(self.edit_button)
 
-        self.rotate_button = Gtk.Button.new_from_icon_name("object-rotate-right-symbolic")
-        self.rotate_button.set_tooltip_text(parent._("Rotate clockwise"))
-        self.rotate_button.set_visible(False)
-        self.rotate_button.connect("clicked", self._rotate_clockwise)
-        header.pack_end(self.rotate_button)
+        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        self.close_button.set_tooltip_text(parent._("Close"))
+        self.close_button.connect("clicked", lambda _button: self.close())
+        header.pack_end(self.close_button)
 
         self.cancel_edit_button = Gtk.Button.new_with_label(parent._("Cancel"))
         self.cancel_edit_button.connect("clicked", self._exit_edit_mode)
@@ -440,10 +440,10 @@ class ViewerWindow(Adw.ApplicationWindow):
             return True
         return False
 
-    def _on_swipe(self, _gesture: Gtk.GestureSwipe, velocity_x: float, _velocity_y: float) -> None:
+    def _on_swipe(self, _gesture: Gtk.GestureSwipe, velocity_x: float, velocity_y: float) -> None:
         if self._editor is not None:
             return
-        self._navigate_from_horizontal_motion(velocity_x, 0)
+        self._navigate_from_horizontal_motion(velocity_x, velocity_y)
 
     def _on_drag_end(self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         if self._editor is not None:
@@ -453,7 +453,7 @@ class ViewerWindow(Adw.ApplicationWindow):
     def _navigate_from_horizontal_motion(self, x: float, y: float) -> None:
         if self.zoom_scale > 1.05:
             return
-        if abs(x) < 60 or abs(x) <= abs(y):
+        if abs(x) < 90 or abs(x) <= abs(y) * 1.8:
             return
         now = GLib.get_monotonic_time()
         if now - self.last_gesture_nav_at < 300_000:

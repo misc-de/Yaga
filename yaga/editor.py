@@ -506,6 +506,8 @@ class EditorView(Gtk.Box):
         self._sticker_source: "str | PILImage.Image | None" = None
         self._sticker_rel = (0.5, 0.5)          # center as fraction of image
         self._sticker_size_frac = 0.25           # sticker width as fraction of image width
+        self._stickers: list[dict] = []
+        self._active_sticker: int | None = None
         self._sticker_zoom_start = 0.25
         self._sticker_del_rect: tuple[float, float, float, float] | None = None
         self._drag_sticker = False
@@ -685,8 +687,13 @@ class EditorView(Gtk.Box):
             sc.set_hexpand(True)
             sc.set_draw_value(False)
             sc.connect("value-changed", self._on_slider, attr)
+            reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+            reset.add_css_class("flat")
+            reset.set_tooltip_text("Reset")
+            reset.connect("clicked", self._reset_slider, attr, sc)
             row.append(l)
             row.append(sc)
+            row.append(reset)
             box.append(row)
         return box
 
@@ -705,8 +712,13 @@ class EditorView(Gtk.Box):
             sc.set_hexpand(True)
             sc.set_draw_value(False)
             sc.connect("value-changed", self._on_slider, attr)
+            reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+            reset.add_css_class("flat")
+            reset.set_tooltip_text("Reset")
+            reset.connect("clicked", self._reset_slider, attr, sc)
             row.append(l)
             row.append(sc)
+            row.append(reset)
             box.append(row)
         return box
 
@@ -825,24 +837,22 @@ class EditorView(Gtk.Box):
         self._text_entry = Gtk.Entry()
         self._text_entry.set_placeholder_text("Text input…")
         self._text_entry.set_hexpand(True)
-        color_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self._text_color_btns: dict[str, tuple] = {}
-        self._text_color_hids: dict[str, int] = {}
-        for cname, cval in [("White", (255, 255, 255)), ("Black", (0, 0, 0)),
-                             ("Yellow", (255, 220, 0)),  ("Red", (220, 30, 30))]:
-            cb = Gtk.ToggleButton(label=cname)
-            cb.add_css_class("flat")
-            cb.set_active(cname == "White")
-            chid = cb.connect("toggled", self._on_text_color_toggled, cname, cval)
-            self._text_color_btns[cname] = (cb, cval)
-            self._text_color_hids[cname] = chid
-            color_box.append(cb)
+        text_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        color = Gdk.RGBA()
+        color.red = 1.0
+        color.green = 1.0
+        color.blue = 1.0
+        color.alpha = 1.0
+        self._text_color_button = Gtk.ColorButton.new_with_rgba(color)
+        self._text_color_button.set_tooltip_text("Text color")
+        self._text_color_button.connect("color-set", self._on_text_color_set)
         add_btn = Gtk.Button(label="Add")
         add_btn.add_css_class("flat")
         add_btn.add_css_class("suggested-action")
         add_btn.connect("clicked", self._on_text_add)
-        text_box.append(self._text_entry)
-        text_box.append(color_box)
+        text_row.append(self._text_entry)
+        text_row.append(self._text_color_button)
+        text_box.append(text_row)
         text_box.append(add_btn)
         self._sticker_sub_stack.add_named(text_box, "text")
 
@@ -904,14 +914,13 @@ class EditorView(Gtk.Box):
             self._frame_theme = None
         self._schedule_update()
 
-    def _on_text_color_toggled(self, btn: Gtk.ToggleButton, cname: str, cval: tuple) -> None:
-        if btn.get_active():
-            self._text_color = cval
-            for name, (b, _) in self._text_color_btns.items():
-                if name != cname and b.get_active():
-                    b.handler_block(self._text_color_hids[name])
-                    b.set_active(False)
-                    b.handler_unblock(self._text_color_hids[name])
+    def _on_text_color_set(self, button: Gtk.ColorButton) -> None:
+        rgba = button.get_rgba()
+        self._text_color = (
+            int(rgba.red * 255),
+            int(rgba.green * 255),
+            int(rgba.blue * 255),
+        )
 
     def _on_text_add(self, _btn: Gtk.Button) -> None:
         text = self._text_entry.get_text().strip()
@@ -1021,14 +1030,43 @@ class EditorView(Gtk.Box):
 
     def _set_sticker(self, source: "str | PILImage.Image | None") -> None:
         self._sticker_source = source
-        self._sticker_rel = (0.5, 0.5)
-        self._sticker_size_frac = 0.15
-        self._sticker_del_rect = None
+        if source is None:
+            if self._active_sticker is not None and 0 <= self._active_sticker < len(self._stickers):
+                self._stickers.pop(self._active_sticker)
+            self._active_sticker = len(self._stickers) - 1 if self._stickers else None
+        else:
+            self._stickers.append({"source": source, "rel": (0.5, 0.5), "size": 0.15})
+            self._active_sticker = len(self._stickers) - 1
+        self._sync_active_sticker()
         self._schedule_update()
 
     def _on_slider(self, sc: Gtk.Scale, attr: str) -> None:
         setattr(self, attr, sc.get_value())
         self._schedule_update()
+
+    def _reset_slider(self, _button: Gtk.Button, attr: str, scale: Gtk.Scale) -> None:
+        setattr(self, attr, 1.0)
+        scale.set_value(1.0)
+        self._schedule_update()
+
+    def _sync_active_sticker(self) -> None:
+        if self._active_sticker is None or not (0 <= self._active_sticker < len(self._stickers)):
+            self._sticker_source = None
+            self._sticker_rel = (0.5, 0.5)
+            self._sticker_size_frac = 0.15
+            self._sticker_del_rect = None
+            return
+        sticker = self._stickers[self._active_sticker]
+        self._sticker_source = sticker["source"]
+        self._sticker_rel = sticker["rel"]
+        self._sticker_size_frac = sticker["size"]
+        self._sticker_del_rect = None
+
+    def _store_active_sticker(self) -> None:
+        if self._active_sticker is None or not (0 <= self._active_sticker < len(self._stickers)):
+            return
+        self._stickers[self._active_sticker]["rel"] = self._sticker_rel
+        self._stickers[self._active_sticker]["size"] = self._sticker_size_frac
 
     # ── Sticker zoom (pinch to resize) ──
 
@@ -1039,6 +1077,7 @@ class EditorView(Gtk.Box):
         if self._sticker_source is None:
             return
         self._sticker_size_frac = max(0.04, min(0.9, self._sticker_zoom_start * scale_delta))
+        self._store_active_sticker()
         self._schedule_update()
 
     # ── Sticker delete (click on X badge) ──
@@ -1080,8 +1119,10 @@ class EditorView(Gtk.Box):
                 self._crop_apply_btn.set_sensitive(False)
                 self._crop_start = (x, y)
                 self._crop_current = (x, y)
-        elif self._sticker_source is not None:
+        elif self._stickers:
             self._drag_sticker = True
+            self._active_sticker = len(self._stickers) - 1
+            self._sync_active_sticker()
             self._drag_sx, self._drag_sy = x, y
 
     def _on_drag_update(self, _g: Gtk.GestureDrag, ox: float, oy: float) -> None:
@@ -1141,6 +1182,7 @@ class EditorView(Gtk.Box):
             max(0.0, min(1.0, (px - ox) / (iw * scale))),
             max(0.0, min(1.0, (py - oy) / (ih * scale))),
         )
+        self._store_active_sticker()
         self._schedule_update()
 
     def _display_to_image(
@@ -1203,14 +1245,17 @@ class EditorView(Gtk.Box):
                 x1, y1, x2, y2 = self._crop_rect_disp
                 self._draw_crop_rect(cr, width, height, x1, y1, x2 - x1, y2 - y1, handles=True)
 
-        if self._sticker_source is not None and not self._crop_mode:
+        if self._stickers and not self._crop_mode:
             iw, ih = self._working.size
             scale = min(width / iw, height / ih)
             ox = (width - iw * scale) / 2
             oy = (height - ih * scale) / 2
-            scx = ox + self._sticker_rel[0] * iw * scale
-            scy = oy + self._sticker_rel[1] * ih * scale
-            half = self._sticker_size_frac * iw * scale / 2
+            active = self._stickers[self._active_sticker or len(self._stickers) - 1]
+            rel = active["rel"]
+            size = active["size"]
+            scx = ox + rel[0] * iw * scale
+            scy = oy + rel[1] * ih * scale
+            half = size * iw * scale / 2
             # Delete button: red circle with × at top-right corner of sticker
             R = 12.0
             del_cx = scx + half
@@ -1245,17 +1290,20 @@ class EditorView(Gtk.Box):
             g = g.point(lambda x: min(255, int(x * self._green)))
             b = b.point(lambda x: min(255, int(x * self._blue)))
             result = PILImage.merge("RGB", (r, g, b))
-        if self._sticker_source is not None:
+        if self._stickers:
             iw, ih = result.size
-            px = max(32, int(self._sticker_size_frac * iw))
-            if isinstance(self._sticker_source, str):
-                si = _get_emoji_pil(self._sticker_source, px)
-            else:
-                si = self._sticker_source.resize((px, int(px * self._sticker_source.height / max(1, self._sticker_source.width))), PILImage.LANCZOS)
-            sx = int(self._sticker_rel[0] * iw - si.width / 2)
-            sy = int(self._sticker_rel[1] * ih - si.height / 2)
             canvas = PILImage.new("RGBA", (iw, ih), (0, 0, 0, 0))
-            canvas.paste(si, (sx, sy))
+            for sticker in self._stickers:
+                px = max(32, int(sticker["size"] * iw))
+                source = sticker["source"]
+                if isinstance(source, str):
+                    si = _get_emoji_pil(source, px)
+                else:
+                    si = source.resize((px, int(px * source.height / max(1, source.width))), PILImage.LANCZOS)
+                rel = sticker["rel"]
+                sx = int(rel[0] * iw - si.width / 2)
+                sy = int(rel[1] * ih - si.height / 2)
+                canvas.paste(si, (sx, sy), si if si.mode == "RGBA" else None)
             result = PILImage.alpha_composite(result.convert("RGBA"), canvas).convert("RGB")
         if self._frame_theme is not None:
             iw, ih = result.size

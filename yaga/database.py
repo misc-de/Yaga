@@ -142,6 +142,11 @@ class Database:
             rows = self.conn.execute(f"SELECT * FROM media WHERE {where} ORDER BY {order}", args).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def get_media_by_path(self, path: str) -> MediaItem | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM media WHERE path = ?", (path,)).fetchone()
+        return self._row_to_item(row) if row else None
+
     def folders(self, category: str) -> list[tuple[str, int, str | None]]:
         with self.lock:
             rows = self.conn.execute(

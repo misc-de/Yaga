@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+from logging.handlers import RotatingFileHandler
 import signal
 import shlex
 import subprocess
 import sys
 import threading
 import shutil
+import time
+from datetime import datetime
 from pathlib import Path
 
 import gi
@@ -19,7 +22,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 from . import APP_ID, APP_NAME
-from .config import Settings
+from .config import DEBUG_LOG_PATH, Settings
 from .database import Database
 from .gallery_grid import GalleryGrid
 from .i18n import Translator
@@ -30,6 +33,17 @@ from .thumbnails import Thumbnailer
 from .viewer import ViewerWindow
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_debug_logging() -> None:
+    root = logging.getLogger()
+    if any(isinstance(handler, RotatingFileHandler) for handler in root.handlers):
+        return
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(DEBUG_LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
 
 
 def _enable_thread_dump_signal() -> None:
@@ -47,6 +61,7 @@ def _enable_thread_dump_signal() -> None:
 class GalleryApplication(Adw.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        _configure_debug_logging()
         _enable_thread_dump_signal()
         GLib.set_application_name(APP_NAME)
         self.connect("activate", self.on_activate)
@@ -79,9 +94,10 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.category_buttons: dict[str, Gtk.ToggleButton] = {}
         self._selection_mode: bool = False
         self._selected_paths: set[str] = set()
-        self._nc_sync_img: Gtk.Image | None = None
-        self._nc_client = None
+        self._nc_spinner: Gtk.Spinner | None = None
+        self._nc_broken_img: Gtk.Image | None = None
         self._nc_folder_sync_generation = 0
+        self._date_group_modes: dict[str, str] = {}
 
         # Track last-rendered view so we can preserve scroll position on refresh
         self._last_render_key: tuple[str, str | None] | None = None
@@ -125,7 +141,6 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         self.refresh_button.set_tooltip_text(self._("Refresh"))
         self.refresh_button.connect("clicked", lambda _b: self.refresh(scan=True))
-        self.header.pack_start(self.refresh_button)
 
         self.settings_button = Gtk.Button.new_from_icon_name("emblem-system-symbolic")
         self.settings_button.set_tooltip_text(self._("Settings"))
@@ -180,6 +195,9 @@ class GalleryWindow(Adw.ApplicationWindow):
         # Virtualized grid (GridView only renders visible tiles)
         self.gallery_grid = GalleryGrid(self)
         self.gallery_grid.scroller.add_tick_callback(self._on_grid_tick)
+        scroll_refresh = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll_refresh.connect("scroll", self._on_pull_refresh_scroll)
+        self.gallery_grid.scroller.add_controller(scroll_refresh)
         folder_swipe = Gtk.GestureSwipe()
         folder_swipe.set_propagation_phase(Gtk.PropagationPhase.BUBBLE)
         folder_swipe.connect("swipe", self._on_folder_swipe)
@@ -211,6 +229,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             ("oldest", "Oldest first", "view-sort-ascending-symbolic"),
             ("name", "Name", "format-text-bold-symbolic"),
             ("folder", "Folder", "folder-symbolic"),
+            ("date", "Date", "view-calendar-symbolic"),
         ]:
             button = Gtk.Button()
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -242,7 +261,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         }
         _nc_icon_dir = Path(__file__).parent / "data" / "icons"
         _dark = Adw.StyleManager.get_default().get_dark()
-        self._nc_sync_img = None
+        self._nc_spinner = None
+        self._nc_broken_img = None
         for category, label, path in self.settings.categories():
             if not path:
                 continue
@@ -259,17 +279,24 @@ class GalleryWindow(Adw.ApplicationWindow):
             vbox.append(lbl)
             button = Gtk.ToggleButton()
             if category == "nextcloud":
-                sync_img = Gtk.Image.new_from_icon_name("emblem-synchronizing-symbolic")
-                sync_img.set_pixel_size(14)
-                sync_img.add_css_class("success")
-                sync_img.set_halign(Gtk.Align.END)
-                sync_img.set_valign(Gtk.Align.END)
-                sync_img.set_visible(False)
+                spinner = Gtk.Spinner()
+                spinner.set_size_request(14, 14)
+                spinner.set_halign(Gtk.Align.END)
+                spinner.set_valign(Gtk.Align.START)
+                spinner.set_visible(False)
+                broken_img = Gtk.Image.new_from_icon_name("network-error-symbolic")
+                broken_img.set_pixel_size(14)
+                broken_img.add_css_class("error")
+                broken_img.set_halign(Gtk.Align.END)
+                broken_img.set_valign(Gtk.Align.START)
+                broken_img.set_visible(False)
                 overlay = Gtk.Overlay()
                 overlay.set_child(vbox)
-                overlay.add_overlay(sync_img)
+                overlay.add_overlay(spinner)
+                overlay.add_overlay(broken_img)
                 button.set_child(overlay)
-                self._nc_sync_img = sync_img
+                self._nc_spinner = spinner
+                self._nc_broken_img = broken_img
             else:
                 button.set_child(vbox)
             button.add_css_class("flat")
@@ -284,11 +311,13 @@ class GalleryWindow(Adw.ApplicationWindow):
         name = "nc-icon-dark.png" if dark else "nc-icon-light.png"
         png = icon_dir / name
         try:
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(png), 88, 88, True)
-            return Gtk.Image.new_from_pixbuf(pixbuf)
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(png), 22, 22, True)
+            img = Gtk.Image.new_from_pixbuf(pixbuf)
+            img.set_pixel_size(22)
+            return img
         except Exception:
             img = Gtk.Image.new_from_icon_name("folder-remote-symbolic")
-            img.set_pixel_size(88)
+            img.set_pixel_size(22)
             return img
 
     def _on_system_theme_changed(self, _mgr, _param) -> None:
@@ -324,10 +353,10 @@ class GalleryWindow(Adw.ApplicationWindow):
                         self.settings.nextcloud_user,
                         pwd,
                     )
-                    self._nc_client = nc_client
                     LOGGER.info("Nextcloud client created for %s", self.settings.nextcloud_url)
                 else:
                     LOGGER.info("No Nextcloud app password available; skipping scan")
+                    GLib.idle_add(self._set_nc_broken, True)
 
             # Phase 1: local categories only
             local_cats = [(c, l, p) for c, l, p in self.settings.categories() if c != "nextcloud"]
@@ -336,6 +365,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             # Phase 2: NC structure scan (no thumbnails)
             if nc_client is not None:
                 GLib.idle_add(self._set_nc_syncing, True)
+                GLib.idle_add(self._set_nc_broken, False)
                 self.scanner.scan_nc_structure(nc_client, self.settings.nextcloud_photos_path)
                 GLib.idle_add(self.refresh, False)  # show folder structure immediately
 
@@ -348,17 +378,32 @@ class GalleryWindow(Adw.ApplicationWindow):
                 )
         except Exception as e:
             LOGGER.exception("Media scan failed: %s", e)
+            GLib.idle_add(self._set_nc_broken, True)
         finally:
+            nc_client = None
             GLib.idle_add(self._set_nc_syncing, False)
             GLib.idle_add(self.refresh, False)
             GLib.idle_add(lambda: self.refresh_button.set_sensitive(True))
 
     def _set_nc_syncing(self, active: bool) -> None:
-        if self._nc_sync_img is not None:
-            self._nc_sync_img.set_visible(active)
+        if self._nc_spinner is not None:
+            self._nc_spinner.set_visible(active)
+            if active:
+                self._nc_spinner.start()
+            else:
+                self._nc_spinner.stop()
+
+    def _set_nc_broken(self, active: bool) -> None:
+        if self._nc_broken_img is not None:
+            self._nc_broken_img.set_visible(active)
 
     def _update_item_thumb(self, path: str, thumb_path: str) -> None:
         updated = self.gallery_grid.update_item_thumb(path, thumb_path)
+        item = self.database.get_media_by_path(path)
+        if item is not None:
+            folder_path = self._visible_child_folder_for_item(item.folder)
+            if folder_path is not None:
+                updated = self.gallery_grid.update_folder_thumb(folder_path, thumb_path) or updated
         if updated:
             LOGGER.debug("Updated visible thumbnail for %s", path)
 
@@ -376,6 +421,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.back_button.set_visible(False)
         if sort_mode == "folder":
             self._render_folders()
+        elif sort_mode == "date":
+            self._render_date_groups()
         else:
             self.current_items = self.database.list_media(
                 self.category, sort_mode, self.current_folder
@@ -406,6 +453,46 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.gallery_grid.set_empty(self._("No pictures found"), total == 0)
         self._set_status("")
 
+    def _render_date_groups(self) -> None:
+        granularity = self._date_group_modes.get(self.category, "day")
+        self.current_items = self.database.list_media(
+            self.category, "newest", self.current_folder
+        )
+        last_header = None
+        for item in self.current_items:
+            header = self._date_group_label(item.mtime, granularity)
+            if header != last_header:
+                self.gallery_grid.append_header(header)
+                last_header = header
+            self.gallery_grid.append_media(item, item.path in self._selected_paths)
+        self._set_status("")
+        self.gallery_grid.set_empty(self._("No pictures found"), not self.current_items)
+
+    def _date_group_label(self, mtime: float, granularity: str) -> str:
+        dt = datetime.fromtimestamp(mtime)
+        if granularity == "week":
+            year, week, _weekday = dt.isocalendar()
+            return f"{year} · Week {week:02d}"
+        if granularity == "month":
+            return dt.strftime("%B %Y")
+        if granularity == "year":
+            return dt.strftime("%Y")
+        return dt.strftime("%Y-%m-%d")
+
+    def _visible_child_folder_for_item(self, item_folder: str) -> str | None:
+        if item_folder in ("", "/"):
+            return None
+        parent = self.current_folder
+        if parent in (None, "/"):
+            return item_folder.split("/", 1)[0]
+        parent_prefix = f"{parent}/"
+        if not item_folder.startswith(parent_prefix):
+            return None
+        remainder = item_folder[len(parent_prefix):]
+        if not remainder or "/" not in remainder and item_folder == parent:
+            return None
+        return f"{parent}/{remainder.split('/', 1)[0]}"
+
     # ------------------------------------------------------------------
     # Item actions
     # ------------------------------------------------------------------
@@ -413,19 +500,26 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _open_folder(self, _button, folder: str) -> None:
         self.current_folder = folder
         self._render()
-        if self.category == "nextcloud" and self._nc_client is not None:
-            nc_client = self._nc_client
+        if self.category == "nextcloud":
             self._nc_folder_sync_generation += 1
             generation = self._nc_folder_sync_generation
             threading.Thread(
-                target=lambda: self._nc_folder_sync_bg(nc_client, folder, generation),
+                target=lambda: self._nc_folder_sync_bg(folder, generation),
                 daemon=True,
             ).start()
 
-    def _nc_folder_sync_bg(self, nc_client, folder: str, generation: int) -> None:
+    def _nc_folder_sync_bg(self, folder: str, generation: int) -> None:
         LOGGER.info("Nextcloud thumbnail sync started for folder %r", folder)
+        nc_client = None
         try:
+            from .nextcloud import NextcloudClient
+            pwd = self.settings.load_app_password()
+            if not pwd:
+                GLib.idle_add(self._set_nc_broken, True)
+                return
+            nc_client = NextcloudClient(self.settings.nextcloud_url, self.settings.nextcloud_user, pwd)
             GLib.idle_add(self._set_nc_syncing, True)
+            GLib.idle_add(self._set_nc_broken, False)
             self.scanner.load_nc_folder_thumbs(
                 nc_client,
                 folder,
@@ -433,7 +527,9 @@ class GalleryWindow(Adw.ApplicationWindow):
             )
         except Exception as e:
             LOGGER.exception("Nextcloud folder sync failed: %s", e)
+            GLib.idle_add(self._set_nc_broken, True)
         finally:
+            nc_client = None
             if generation == self._nc_folder_sync_generation:
                 GLib.idle_add(self._set_nc_syncing, False)
             LOGGER.info("Nextcloud thumbnail sync finished for folder %r", folder)
@@ -663,6 +759,14 @@ class GalleryWindow(Adw.ApplicationWindow):
             self._go_back_folder()
 
     def _set_sort_mode(self, _button: Gtk.Button, mode: str, popover: Gtk.Popover) -> None:
+        if mode == "date":
+            current_mode = self.settings.sort_modes.get(self.category)
+            order = ["day", "week", "month", "year"]
+            current_group = self._date_group_modes.get(self.category, "day")
+            if current_mode == "date":
+                current_group = order[(order.index(current_group) + 1) % len(order)]
+            self._date_group_modes[self.category] = current_group
+            self._set_status(self._date_group_label(time.time(), current_group).split(" · ")[0])
         self.settings.sort_modes[self.category] = mode
         self.settings.save()
         self.current_folder = None
@@ -693,6 +797,14 @@ class GalleryWindow(Adw.ApplicationWindow):
             self._update_tile_size(width)
         return GLib.SOURCE_CONTINUE
 
+    def _on_pull_refresh_scroll(self, _controller: Gtk.EventControllerScroll, _dx: float, dy: float) -> bool:
+        adjustment = self.gallery_grid.get_vadjustment()
+        if dy < -0.8 and adjustment.get_value() <= adjustment.get_lower() + 1:
+            LOGGER.info("Pull refresh triggered")
+            self.refresh(scan=True)
+            return True
+        return False
+
     def _update_tile_size(self, scroller_width: int) -> None:
         if scroller_width <= 0:
             return
@@ -716,6 +828,11 @@ class GalleryWindow(Adw.ApplicationWindow):
             }
             .gallery-tile > * {
                 margin: 0;
+            }
+            .gallery-tile.date-header {
+                background: transparent;
+                opacity: 1;
+                font-weight: 700;
             }
             gridview.gallery-grid > child {
                 padding: 1px;

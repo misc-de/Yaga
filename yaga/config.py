@@ -13,6 +13,7 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ya
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "yaga"
 THUMB_DIR = CACHE_DIR / "thumbnails"
 DB_PATH = DATA_DIR / "yaga.sqlite3"
+DEBUG_LOG_PATH = CACHE_DIR / "debug.log"
 
 
 def default_path(name: str) -> str:

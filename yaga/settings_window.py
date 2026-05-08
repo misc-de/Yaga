@@ -15,6 +15,7 @@ from .config import Settings
 class SettingsWindow(Adw.PreferencesWindow):
     def __init__(self, parent: GalleryWindow) -> None:
         super().__init__(transient_for=parent, modal=True, title=parent._("Settings"))
+        self.set_search_enabled(False)
         self.parent_window = parent
         self.settings = Settings(**parent.settings.__dict__)
         self._build()
