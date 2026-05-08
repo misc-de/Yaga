@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .config import THUMB_DIR
 from .models import MediaItem
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Thumbnailer:
@@ -35,10 +39,51 @@ class Thumbnailer:
             shutil.rmtree(THUMB_DIR)
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
 
+    def ensure_thumbnails_batch(self, items: list[MediaItem], max_workers: int | None = None) -> dict[str, str | None]:
+        """
+        Generate thumbnails for multiple items in parallel.
+        Uses ThreadPoolExecutor to process videos concurrently.
+        Returns dict mapping item paths to thumbnail paths (or None if failed).
+        """
+        if not items:
+            return {}
+        
+        # Default: use CPU count (good for video encoding)
+        import os
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 threads to avoid resource exhaustion
+        
+        result: dict[str, str | None] = {}
+        
+        def _ensure_one(item: MediaItem) -> tuple[str, str | None]:
+            thumb = self.ensure_thumbnail(item)
+            return (item.path, thumb)
+        
+        LOGGER.debug("Batch thumbnail generation for %d items (max_workers=%d)", len(items), max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for path, thumb in executor.map(_ensure_one, items, timeout=300):
+                result[path] = thumb
+        
+        return result
+
     def _image_thumbnail(self, path: Path, target: Path) -> str | None:
+        # Try PIL/Pillow first (supports most standard formats)
+        try:
+            from PIL import Image as PILImage
+            img = PILImage.open(str(path))
+            # Resize to thumbnail size
+            img.thumbnail((320, 320), PILImage.LANCZOS)
+            # Ensure RGB mode for JPEG
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            img.save(str(target), "JPEG", quality=85)
+            return str(target)
+        except Exception:
+            pass
+        
+        # Fallback: Try GdkPixbuf (built-in GNOME library)
         try:
             import gi
-
             gi.require_version("GdkPixbuf", "2.0")
             from gi.repository import GdkPixbuf
 
@@ -47,7 +92,22 @@ class Thumbnailer:
                 pixbuf.savev(str(target), "jpeg", ["quality"], ["85"])
                 return str(target)
         except Exception:
-            return None
+            pass
+        
+        # Optional: Try rawpy for RAW image support
+        if path.suffix.lower() in {".raw", ".dng", ".cr2", ".nef", ".arw", ".raf", ".rw2", ".orf", ".x3f", ".dcr", ".crw"}:
+            try:
+                import rawpy
+                raw = rawpy.imread(str(path))
+                rgb = raw.postprocess()
+                from PIL import Image as PILImage
+                img = PILImage.fromarray(rgb)
+                img.thumbnail((320, 320), PILImage.LANCZOS)
+                img.save(str(target), "JPEG", quality=85)
+                return str(target)
+            except Exception:
+                pass
+        
         return None
 
     def _video_thumbnail(self, path: Path, target: Path) -> str | None:

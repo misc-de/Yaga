@@ -102,6 +102,11 @@ class ViewerWindow(Adw.ApplicationWindow):
         self._rotation: int = 0
         self._current_display_path: str | None = None
         self._current_is_video: bool = False
+        
+        # Slideshow state
+        self._slideshow_active: bool = False
+        self._slideshow_timeout_id: int | None = None
+        self._slideshow_interval_ms: int = 3000  # 3 seconds
         self.toolbar = Adw.ToolbarView()
         self.set_content(self.toolbar)
 
@@ -145,6 +150,20 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.cancel_edit_button.set_visible(False)
         header.pack_start(self.cancel_edit_button)
 
+        self.undo_edit_button = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+        self.undo_edit_button.set_tooltip_text(parent._("Undo"))
+        self.undo_edit_button.connect("clicked", self._undo_edit)
+        self.undo_edit_button.set_visible(False)
+        self.undo_edit_button.set_sensitive(False)
+        header.pack_start(self.undo_edit_button)
+
+        self.redo_edit_button = Gtk.Button.new_from_icon_name("edit-redo-symbolic")
+        self.redo_edit_button.set_tooltip_text(parent._("Redo"))
+        self.redo_edit_button.connect("clicked", self._redo_edit)
+        self.redo_edit_button.set_visible(False)
+        self.redo_edit_button.set_sensitive(False)
+        header.pack_start(self.redo_edit_button)
+
         self.save_edit_button = Gtk.Button.new_with_label(parent._("Save"))
         self.save_edit_button.add_css_class("suggested-action")
         self.save_edit_button.connect("clicked", self._save_edit)
@@ -156,6 +175,12 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.fullscreen_btn.connect("clicked", self._toggle_fullscreen)
         self.fullscreen_btn.set_visible(False)
         header.pack_end(self.fullscreen_btn)
+
+        self.slideshow_button = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
+        self.slideshow_button.set_tooltip_text(parent._("Start slideshow"))
+        self.slideshow_button.connect("clicked", self._toggle_slideshow)
+        self.slideshow_button.set_visible(False)
+        header.pack_end(self.slideshow_button)
 
         self._editor: EditorView | None = None
         self.toolbar.add_top_bar(header)
@@ -244,6 +269,7 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.info_button.set_visible(visible)
         self.edit_button.set_visible(visible and _PIL_OK and not self._current_is_video)
         self.rotate_button.set_visible(visible and not self._current_is_video)
+        self.slideshow_button.set_visible(visible and not self._current_is_video)  # Slideshow only for images
         self.fullscreen_btn.set_visible(visible and self._current_is_video)
 
     def _set_view_gestures_enabled(self, enabled: bool) -> None:
@@ -386,6 +412,10 @@ class ViewerWindow(Adw.ApplicationWindow):
             GLib.idle_add(lambda: (self.header.set_visible(False), GLib.SOURCE_REMOVE)[1])
 
     def _on_close_request(self, _window) -> bool:
+        # Stop slideshow before closing
+        if self._slideshow_active:
+            self._stop_slideshow()
+        
         if self._rotation != 0:
             self._check_rotation_before_action(self.destroy)
             return True
@@ -571,9 +601,21 @@ class ViewerWindow(Adw.ApplicationWindow):
         if not _PIL_OK:
             self.parent_window._set_status(self.parent_window._("Could not open editor"))
             return
+        
+        # Stop slideshow when entering edit mode
+        if self._slideshow_active:
+            self._stop_slideshow()
+        
         item = self.items[self.index]
         if item.is_video:
             return
+        
+        # Check if it's a RAW image (not editable with PIL)
+        from .models import RAW_EXTENSIONS
+        if Path(item.path).suffix.lower() in RAW_EXTENSIONS:
+            self.parent_window._set_status(self.parent_window._("RAW images cannot be edited with the built-in editor"))
+            return
+        
         edit_path = self._current_display_path or item.path
         if is_nc_path(edit_path) or not Path(edit_path).exists():
             self.parent_window._set_status(self.parent_window._("Could not open editor"))
@@ -591,6 +633,8 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.fullscreen_btn.set_visible(False)
         self.cancel_edit_button.set_visible(True)
         self.save_edit_button.set_visible(True)
+        self.undo_edit_button.set_visible(True)
+        self.redo_edit_button.set_visible(True)
         child = self.stack.get_first_child()
         while child:
             nxt = child.get_next_sibling()
@@ -606,6 +650,7 @@ class ViewerWindow(Adw.ApplicationWindow):
             return
         self.stack.add_child(self._editor)
         self.stack.set_visible_child(self._editor)
+        self._update_edit_buttons()  # Update undo/redo button states
 
     def _exit_edit_mode(self, _button=None) -> None:
         self._editor = None
@@ -615,6 +660,8 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.close_button.set_visible(True)
         self.cancel_edit_button.set_visible(False)
         self.save_edit_button.set_visible(False)
+        self.undo_edit_button.set_visible(False)
+        self.redo_edit_button.set_visible(False)
         self.show_item()
 
     def _save_edit(self, _button: Gtk.Button) -> None:
@@ -627,7 +674,12 @@ class ViewerWindow(Adw.ApplicationWindow):
 
     def _save_edit_worker(self, editor) -> None:
         try:
-            editor.save_as_new()
+            local_path = editor.save_as_new()
+            
+            # Check if original file is from Nextcloud and upload if needed
+            if is_nc_path(editor._item.path):
+                self._upload_to_nextcloud(local_path)
+            
             GLib.idle_add(self._save_edit_done, True)
         except Exception:
             GLib.idle_add(self._save_edit_done, False)
@@ -640,6 +692,68 @@ class ViewerWindow(Adw.ApplicationWindow):
             return
         self.parent_window.refresh(scan=True)
         self._exit_edit_mode()
+
+    def _undo_edit(self, _button: Gtk.Button) -> None:
+        """Undo last edit in the editor."""
+        if self._editor is None:
+            return
+        self._editor.undo()
+        self._update_edit_buttons()
+
+    def _redo_edit(self, _button: Gtk.Button) -> None:
+        """Redo last undone edit in the editor."""
+        if self._editor is None:
+            return
+        self._editor.redo()
+        self._update_edit_buttons()
+
+    def _update_edit_buttons(self) -> None:
+        """Update undo/redo button sensitivity based on editor state."""
+        if self._editor is None:
+            return
+        self.undo_edit_button.set_sensitive(self._editor.can_undo())
+        self.redo_edit_button.set_sensitive(self._editor.can_redo())
+
+    def _upload_to_nextcloud(self, local_edited_path: str) -> None:
+        """Upload edited image back to Nextcloud."""
+        from .nextcloud import NextcloudClient, dav_path_from_nc, NC_PATH_PREFIX
+        
+        if self._editor is None:
+            return
+        
+        # Get Nextcloud credentials from settings
+        settings = self.parent_window.settings
+        if not settings.nextcloud_url or not settings.nextcloud_user:
+            LOGGER.warning("Nextcloud credentials not configured")
+            return
+        
+        # Get Nextcloud password from system keyring
+        try:
+            pwd = settings.load_app_password()
+            if not pwd:
+                LOGGER.warning("Nextcloud password not available")
+                return
+        except Exception as exc:
+            LOGGER.warning("Could not retrieve Nextcloud password: %s", exc)
+            return
+        
+        try:
+            client = NextcloudClient(settings.nextcloud_url, settings.nextcloud_user, pwd)
+            
+            # Get the original DAV path
+            original_dav_path = dav_path_from_nc(self._editor._item.path)
+            
+            # Upload to the same location
+            success = client.upload_file(local_edited_path, original_dav_path)
+            
+            if success:
+                LOGGER.info("Successfully uploaded edited image to Nextcloud")
+                # Optionally update UI to show success
+            else:
+                LOGGER.warning("Failed to upload edited image to Nextcloud")
+        except Exception as exc:
+            LOGGER.exception("Error uploading to Nextcloud: %s", exc)
+
 
     def _toggle_fullscreen(self, _btn=None) -> None:
         if self.props.fullscreened:
@@ -691,6 +805,29 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.index = min(self.index, len(self.items) - 1)
         self.show_item()
 
+    def _get_cached_exif(self, item: MediaItem) -> dict[str, str]:
+        """Get EXIF data from cache (DB) or parse and cache if missing."""
+        import json
+        # Try to get cached EXIF from database
+        cached_json = self.parent_window.database.get_exif_data(item.path, item.category)
+        if cached_json:
+            try:
+                return json.loads(cached_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # If not cached or corrupted, parse and cache
+        exif = _extract_exif(item.path)
+        if exif:
+            try:
+                exif_json = json.dumps(exif)
+                self.parent_window.database.set_exif_data(item.path, exif_json, item.category)
+                self.parent_window.database.commit()
+            except Exception:
+                # If caching fails, still return the parsed EXIF
+                pass
+        return exif
+
     def _show_info(self, _button: Gtk.Button) -> None:
         item = self.items[self.index]
         _ = self.parent_window._
@@ -705,7 +842,7 @@ class ViewerWindow(Adw.ApplicationWindow):
             dims = _image_dimensions(item.path)
             if dims:
                 rows.append((_("Dimensions"), dims))
-            exif = _extract_exif(item.path)
+            exif = self._get_cached_exif(item)
             for key in ("Camera", "GPS"):
                 if key in exif:
                     rows.append((_(key), exif[key]))
@@ -732,3 +869,51 @@ class ViewerWindow(Adw.ApplicationWindow):
         popover.set_parent(self.info_button)
         popover.set_child(grid)
         popover.popup()
+
+    def _toggle_slideshow(self, _button: Gtk.Button) -> None:
+        """Toggle slideshow mode on/off."""
+        if self._slideshow_active:
+            self._stop_slideshow()
+        else:
+            self._start_slideshow()
+
+    def _start_slideshow(self) -> None:
+        """Start automatic slideshow."""
+        self._slideshow_active = True
+        self.slideshow_button.set_icon_name("media-playback-pause-symbolic")
+        self.slideshow_button.set_tooltip_text(self.parent_window._("Stop slideshow"))
+        self._schedule_next_slide()
+
+    def _stop_slideshow(self) -> None:
+        """Stop automatic slideshow."""
+        self._slideshow_active = False
+        self.slideshow_button.set_icon_name("media-playback-start-symbolic")
+        self.slideshow_button.set_tooltip_text(self.parent_window._("Start slideshow"))
+        if self._slideshow_timeout_id is not None:
+            GLib.source_remove(self._slideshow_timeout_id)
+            self._slideshow_timeout_id = None
+
+    def _schedule_next_slide(self) -> None:
+        """Schedule the next slide transition."""
+        if not self._slideshow_active:
+            return
+        self._slideshow_timeout_id = GLib.timeout_add(
+            self._slideshow_interval_ms,
+            self._on_slideshow_tick,
+        )
+
+    def _on_slideshow_tick(self) -> bool:
+        """Called on slideshow timer tick. Advance to next image or loop."""
+        if not self._slideshow_active:
+            return GLib.SOURCE_REMOVE
+        
+        # If current item is video, skip it (show next static image)
+        if self._current_is_video:
+            self.index = (self.index + 1) % len(self.items)
+        else:
+            # Advance to next
+            self.index = (self.index + 1) % len(self.items)
+        
+        self.show_item()
+        self._schedule_next_slide()
+        return GLib.SOURCE_REMOVE

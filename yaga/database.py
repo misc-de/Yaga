@@ -52,6 +52,11 @@ CREATE INDEX IF NOT EXISTS idx_media_mtime ON media(mtime);
 PRAGMA user_version = 1;
 """
 
+_MIGRATION_V2 = """
+ALTER TABLE media ADD COLUMN exif_data TEXT DEFAULT NULL;
+PRAGMA user_version = 2;
+"""
+
 
 class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
@@ -72,6 +77,15 @@ class Database:
             ).fetchone()
             if info and "UNIQUE(path, category)" not in info["sql"]:
                 self.conn.executescript(_MIGRATION_V1)
+        if version < 2:
+            # Add EXIF cache column
+            try:
+                self.conn.execute("ALTER TABLE media ADD COLUMN exif_data TEXT DEFAULT NULL")
+                self.conn.execute("PRAGMA user_version = 2")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
 
     def upsert_media(self, *, path: Path, category: str, media_type: str, folder: str, thumb_path: str | None) -> None:
         stat = path.stat()
@@ -127,6 +141,30 @@ class Database:
                 )
             else:
                 self.conn.execute("UPDATE media SET thumb_path = ? WHERE path = ?", (thumb_path, path))
+
+    def set_exif_data(self, path: str, exif_json: str, category: str | None = None) -> None:
+        """Store cached EXIF data (JSON) for a media item."""
+        with self.lock:
+            if category is not None:
+                self.conn.execute(
+                    "UPDATE media SET exif_data = ? WHERE path = ? AND category = ?",
+                    (exif_json, path, category),
+                )
+            else:
+                self.conn.execute("UPDATE media SET exif_data = ? WHERE path = ?", (exif_json, path))
+
+    def get_exif_data(self, path: str, category: str | None = None) -> str | None:
+        """Retrieve cached EXIF data (JSON) for a media item."""
+        with self.lock:
+            if category is not None:
+                row = self.conn.execute(
+                    "SELECT exif_data FROM media WHERE path = ? AND category = ?", (path, category)
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT exif_data FROM media WHERE path = ?", (path,)
+                ).fetchone()
+        return row["exif_data"] if row else None
 
     def commit(self) -> None:
         with self.lock:

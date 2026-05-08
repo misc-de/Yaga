@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".avif"}
+RAW_EXTENSIONS = {".raw", ".dng", ".cr2", ".nef", ".arw", ".raf", ".rw2", ".orf", ".x3f", ".dcr", ".crw"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".3gp", ".mpeg", ".mpg"}
 
 
@@ -33,6 +34,8 @@ def media_type_for(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
         return "image"
+    if suffix in RAW_EXTENSIONS:
+        return "image"  # RAW files are treated as images
     if suffix in VIDEO_EXTENSIONS:
         return "video"
     return None

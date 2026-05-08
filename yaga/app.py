@@ -54,6 +54,23 @@ def _enable_thread_dump_signal() -> None:
             LOGGER.debug("Could not register SIGUSR1 thread dump handler", exc_info=True)
 
 
+def _cleanup_abandoned_temp_files() -> None:
+    """Clean up leftover _edit_*.jpg files from crashes or interrupted edits."""
+    try:
+        home = Path.home()
+        # Scan common photo directories for orphaned temp files
+        for pattern_dir in [home / "Pictures", home / "Photos", home / "Downloads"]:
+            if pattern_dir.exists():
+                for temp_file in pattern_dir.rglob("*_edit_*.jpg"):
+                    try:
+                        temp_file.unlink(missing_ok=True)
+                        LOGGER.debug("Cleaned up temp file: %s", temp_file)
+                    except OSError as e:
+                        LOGGER.debug("Could not remove temp file %s: %s", temp_file, e)
+    except Exception as e:
+        LOGGER.debug("Temp file cleanup failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
@@ -69,6 +86,10 @@ class GalleryApplication(Adw.Application):
     def on_activate(self, _app: Adw.Application) -> None:
         icons_dir = Path(__file__).parent / "data" / "icons"
         Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(icons_dir))
+        
+        # Cleanup leftover temp files from previous sessions
+        _cleanup_abandoned_temp_files()
+        
         window = GalleryWindow(self)
         window.present()
 
@@ -146,6 +167,11 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.settings_button.set_tooltip_text(self._("Settings"))
         self.settings_button.connect("clicked", self._open_settings)
         self.header.pack_start(self.settings_button)
+
+        self.help_button = Gtk.Button.new_from_icon_name("help-about-symbolic")
+        self.help_button.set_tooltip_text(self._("Privacy & Help"))
+        self.help_button.connect("clicked", self._show_privacy_info)
+        self.header.pack_start(self.help_button)
 
         self.sort_button = Gtk.MenuButton(icon_name="view-sort-descending-symbolic")
         self.sort_button.set_tooltip_text(self._("Sort"))
@@ -779,6 +805,96 @@ class GalleryWindow(Adw.ApplicationWindow):
 
     def _open_settings(self, _button: Gtk.Button) -> None:
         SettingsWindow(self).present()
+
+    def _show_privacy_info(self, _button: Gtk.Button) -> None:
+        """Show privacy and help information dialog."""
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading=self._("Privacy & Help"),
+        )
+        
+        # Build content with privacy information
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content_box.set_margin_top(12)
+        content_box.set_margin_bottom(12)
+        content_box.set_margin_start(12)
+        content_box.set_margin_end(12)
+        
+        # Section 1: EXIF Data
+        section1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        title1 = Gtk.Label(label=self._("EXIF Data"))
+        title1.add_css_class("title-2")
+        title1.set_halign(Gtk.Align.START)
+        section1.append(title1)
+        
+        text1 = Gtk.Label(
+            label=self._(
+                "Photos often contain sensitive metadata (EXIF data):\n"
+                "• Camera make & model\n"
+                "• GPS coordinates and location history\n"
+                "• Timestamp and date taken\n\n"
+                "This app displays EXIF data in the Image Info panel. "
+                "Be careful when sharing photos online, as metadata "
+                "can reveal your location and privacy details."
+            ),
+            wrap=True,
+            justify=Gtk.Justification.LEFT,
+        )
+        text1.add_css_class("body")
+        section1.append(text1)
+        content_box.append(section1)
+        
+        # Section 2: Photo Deletion
+        section2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        title2 = Gtk.Label(label=self._("Deleting Photos"))
+        title2.add_css_class("title-2")
+        title2.set_halign(Gtk.Align.START)
+        section2.append(title2)
+        
+        text2 = Gtk.Label(
+            label=self._(
+                "When you delete photos in Yaga, they are moved to trash. "
+                "They can typically be recovered from your system trash until "
+                "it is permanently emptied. For secure deletion, consider using "
+                "specialized tools or encrypted storage."
+            ),
+            wrap=True,
+            justify=Gtk.Justification.LEFT,
+        )
+        text2.add_css_class("body")
+        section2.append(text2)
+        content_box.append(section2)
+        
+        # Section 3: Nextcloud
+        section3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        title3 = Gtk.Label(label=self._("Nextcloud Integration"))
+        title3.add_css_class("title-2")
+        title3.set_halign(Gtk.Align.START)
+        section3.append(title3)
+        
+        text3 = Gtk.Label(
+            label=self._(
+                "Nextcloud passwords are stored in your system keyring "
+                "(or local file with restricted permissions). "
+                "Ensure your Nextcloud instance uses HTTPS to protect data in transit."
+            ),
+            wrap=True,
+            justify=Gtk.Justification.LEFT,
+        )
+        text3.add_css_class("body")
+        section3.append(text3)
+        content_box.append(section3)
+        
+        # Scrollable container
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_child(content_box)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_max_content_height(400)
+        
+        dialog.set_extra_child(scrolled)
+        dialog.add_response("close", self._("OK"))
+        dialog.set_default_response("close")
+        dialog.present()
 
     def apply_settings(self, settings: Settings) -> None:
         self._selection_mode = False

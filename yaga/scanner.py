@@ -15,11 +15,14 @@ class MediaScanner:
     def __init__(self, database: Database, thumbnailer: Thumbnailer) -> None:
         self.database = database
         self.thumbnailer = thumbnailer
+        self._visited_inodes: set[tuple] = set()  # Track (device, inode) to prevent symlink loops
 
     def scan(self, categories: list[tuple[str, str, str]], nc_client=None,
              nc_thumbnail_only: bool = True) -> None:
         started = time.time()
         scanned_categories: list[str] = []
+        self._visited_inodes.clear()  # Reset for fresh scan
+        
         for category, _label, root_text in categories:
             if category == "nextcloud":
                 if nc_client is not None:
@@ -30,15 +33,43 @@ class MediaScanner:
             if not root.exists():
                 continue
             scanned_categories.append(category)
+            
+            # Check for symlink: skip if root itself is a symlink
+            if root.is_symlink():
+                LOGGER.warning("Skipping symlink root folder: %s", root)
+                continue
+            
             for path in root.rglob("*"):
+                # Skip symlinks to prevent infinite loops and unexpected behavior
+                if path.is_symlink():
+                    LOGGER.debug("Skipping symlink: %s", path)
+                    continue
+                
                 if not path.is_file():
                     continue
+                
+                # Optional: Track visited directories (inode) to detect symlink loops
+                # This provides defense-in-depth if rglob() encounters symlinks
+                try:
+                    stat = path.stat()
+                    inode_key = (stat.st_dev, stat.st_ino)
+                    if inode_key in self._visited_inodes and path.is_dir():
+                        LOGGER.debug("Skipping already-visited directory (potential symlink loop): %s", path)
+                        continue
+                    if path.is_dir():
+                        self._visited_inodes.add(inode_key)
+                except (OSError, ValueError):
+                    # If we can't stat the path, skip it (broken symlink, permission denied, etc.)
+                    LOGGER.debug("Skipping path that cannot be stat'd: %s", path)
+                    continue
+                
                 media_type = media_type_for(path)
                 if not media_type:
                     continue
                 folder = self._relative_folder(root, path.parent)
                 thumb = self.thumbnailer.ensure_thumbnail(path, media_type)
                 self.database.upsert_media(path=path, category=category, media_type=media_type, folder=folder, thumb_path=thumb)
+        
         self.database.prune_missing(started, scanned_categories)
         self.database.commit()
 

@@ -213,3 +213,45 @@ class NextcloudClient:
         finally:
             conn.close()
         return None
+
+    def upload_file(self, local_path: Path | str, dav_path: str) -> bool:
+        """
+        Upload a local file to Nextcloud.
+        Returns True on success, False on failure.
+        """
+        local_path = Path(local_path)
+        if not local_path.exists():
+            LOGGER.error("Local file does not exist: %s", local_path)
+            return False
+        
+        try:
+            file_content = local_path.read_bytes()
+        except Exception as exc:
+            LOGGER.error("Failed to read local file %s: %s", local_path, exc)
+            return False
+        
+        conn = self._conn()
+        try:
+            headers = self._headers()
+            headers["Content-Type"] = "application/octet-stream"
+            conn.request(
+                "PUT",
+                quote(dav_path, safe="/:@!$&'()*+,;="),
+                body=file_content,
+                headers=headers,
+            )
+            resp = conn.getresponse()
+            resp.read()  # consume response body
+            
+            if resp.status in (201, 204):  # Created or No Content
+                LOGGER.info("Successfully uploaded %s to %s", local_path, dav_path)
+                return True
+            
+            LOGGER.warning("Nextcloud upload HTTP %s for %s", resp.status, dav_path)
+            return False
+        except Exception as exc:
+            LOGGER.error("Nextcloud upload failed for %s: %s", dav_path, exc)
+            return False
+        finally:
+            conn.close()
+

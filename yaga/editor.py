@@ -522,9 +522,15 @@ class EditorView(Gtk.Box):
 
         # obfuscate (blur brush)
         self._obfuscate_mode: bool = False
-        self._obfuscate_strokes: list[tuple[float, float, float]] = []
+        self._obfuscate_strokes: list[tuple[float, float, float, tuple[float, float, float, float]]] = []  # (x, y, r, (r, g, b, a))
         self._obfuscate_brush_size: float = 0.08
         self._obfuscate_drag_origin: tuple[float, float] | None = None
+
+        # Undo/Redo history
+        self._history_undo: list["PILImage.Image"] = []
+        self._history_redo: list["PILImage.Image"] = []
+        self._history_max_steps: int = 20  # Limit memory usage
+        self._slider_snapshot_id: int | None = None  # Debounce timer for slider changes
 
         self._active_panel: str | None = None
         self._update_id: int | None = None
@@ -1034,6 +1040,7 @@ class EditorView(Gtk.Box):
     def _on_filter_toggled(self, btn: Gtk.ToggleButton, mode: str) -> None:
         if not btn.get_active():
             return
+        self._snapshot_state()  # Save state before filter change
         self._filter_mode = mode
         for m, b in self._filter_btns.items():
             if m != mode:
@@ -1048,6 +1055,7 @@ class EditorView(Gtk.Box):
 
     def _apply_crop(self, _btn: Gtk.Button) -> None:
         if self._pending_crop:
+            self._snapshot_state()  # Save state before crop
             self._working = self._working.crop(self._pending_crop)
             self._pending_crop = None
             self._crop_start = self._crop_current = None
@@ -1058,6 +1066,7 @@ class EditorView(Gtk.Box):
             self._schedule_update()
 
     def _reset_working(self, _btn: Gtk.Button) -> None:
+        self._snapshot_state()  # Save current state before full reset
         self._working = self._original.copy()
         self._pending_crop = None
         self._crop_start = self._crop_current = None
@@ -1071,6 +1080,7 @@ class EditorView(Gtk.Box):
         self._set_sticker(source)
 
     def _set_sticker(self, source: "str | PILImage.Image | None") -> None:
+        self._snapshot_state()  # Save state before sticker change
         self._sticker_source = source
         if source is None:
             if self._active_sticker is not None and 0 <= self._active_sticker < len(self._stickers):
@@ -1085,8 +1095,22 @@ class EditorView(Gtk.Box):
     def _on_slider(self, sc: Gtk.Scale, attr: str) -> None:
         setattr(self, attr, sc.get_value())
         self._schedule_update()
+        self._schedule_slider_snapshot()
+
+    def _schedule_slider_snapshot(self) -> None:
+        """Schedule a debounced snapshot for slider changes (500ms delay)."""
+        if self._slider_snapshot_id is not None:
+            GLib.source_remove(self._slider_snapshot_id)
+        self._slider_snapshot_id = GLib.timeout_add(500, self._slider_snapshot_cb)
+
+    def _slider_snapshot_cb(self) -> bool:
+        """Called after slider movement stops (debounce callback)."""
+        self._slider_snapshot_id = None
+        self._snapshot_state()
+        return GLib.SOURCE_REMOVE
 
     def _reset_slider(self, _button: Gtk.Button, attr: str, scale: Gtk.Scale) -> None:
+        self._snapshot_state()  # Save state before reset
         setattr(self, attr, 1.0)
         scale.set_value(1.0)
         self._schedule_update()
@@ -1239,6 +1263,33 @@ class EditorView(Gtk.Box):
         self._store_active_sticker()
         self._schedule_update()
 
+    def _sample_color_at(self, img: "PILImage.Image", rel_x: float, rel_y: float, sample_radius: int = 10) -> tuple[float, float, float, float]:
+        """Sample average color from a region around a point. Returns (r, g, b, a) in 0-1 range."""
+        iw, ih = img.size
+        cx = int(rel_x * iw)
+        cy = int(rel_y * ih)
+        x1 = max(0, cx - sample_radius)
+        y1 = max(0, cy - sample_radius)
+        x2 = min(iw, cx + sample_radius + 1)
+        y2 = min(ih, cy + sample_radius + 1)
+        
+        if x2 <= x1 or y2 <= y1:
+            return (0.5, 0.5, 0.5, 0.3)  # Default gray if invalid region
+        
+        try:
+            region = img.crop((x1, y1, x2, y2))
+            # Convert to RGB if needed
+            if region.mode != "RGB":
+                region = region.convert("RGB")
+            # Get average color
+            import numpy as np
+            arr = np.array(region, dtype=np.float32)
+            avg = np.mean(arr, axis=(0, 1))
+            r, g, b = avg / 255.0
+            return (r, g, b, 0.35)  # Use slight transparency
+        except Exception:
+            return (0.5, 0.5, 0.5, 0.3)
+
     def _add_obfuscate_stroke(self, px: float, py: float) -> None:
         dw = self._draw_area.get_width()
         dh = self._draw_area.get_height()
@@ -1250,7 +1301,9 @@ class EditorView(Gtk.Box):
         oy = (dh - ih * scale) / 2
         rel_x = (px - ox) / (iw * scale)
         rel_y = (py - oy) / (ih * scale)
-        self._obfuscate_strokes.append((rel_x, rel_y, self._obfuscate_brush_size))
+        # Sample the color from the underlying image
+        color = self._sample_color_at(self._working, rel_x, rel_y)
+        self._obfuscate_strokes.append((rel_x, rel_y, self._obfuscate_brush_size, color))
         self._draw_area.queue_draw()
 
     def _on_obfuscate_toggled(self, btn: Gtk.ToggleButton) -> None:
@@ -1261,6 +1314,7 @@ class EditorView(Gtk.Box):
         self._obfuscate_brush_size = sc.get_value()
 
     def _reset_obfuscate(self, _btn: Gtk.Button) -> None:
+        self._snapshot_state()  # Save state before clearing obfuscate
         self._obfuscate_strokes = []
         self._schedule_update()
 
@@ -1357,11 +1411,11 @@ class EditorView(Gtk.Box):
             scale = min(width / iw, height / ih)
             ox = (width - iw * scale) / 2
             oy = (height - ih * scale) / 2
-            for rel_x, rel_y, rel_r in self._obfuscate_strokes:
+            for rel_x, rel_y, rel_r, color in self._obfuscate_strokes:
                 cx = ox + rel_x * iw * scale
                 cy = oy + rel_y * ih * scale
                 r = max(4.0, rel_r * min(iw, ih) * scale)
-                cr.set_source_rgba(0.15, 0.45, 0.90, 0.22)
+                cr.set_source_rgba(*color)  # Use sampled color
                 cr.arc(cx, cy, r, 0, 2 * math.pi)
                 cr.fill()
 
@@ -1402,7 +1456,7 @@ class EditorView(Gtk.Box):
             blurred = result.filter(ImageFilter.GaussianBlur(radius=max(4, iw2 // 40)))
             obf_mask = PILImage.new("L", (iw2, ih2), 0)
             obf_draw = ImageDraw.Draw(obf_mask)
-            for rel_x, rel_y, rel_r in self._obfuscate_strokes:
+            for rel_x, rel_y, rel_r, _color in self._obfuscate_strokes:  # Ignore color tuple in processing
                 cx = int(rel_x * iw2)
                 cy = int(rel_y * ih2)
                 r = max(4, int(rel_r * min(iw2, ih2)))
@@ -1434,10 +1488,55 @@ class EditorView(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
+    # Undo/Redo
+    # ------------------------------------------------------------------
+
+    def _snapshot_state(self) -> None:
+        """Save current working image to undo stack (call after each edit)."""
+        # Clear redo stack when new edit is made
+        self._history_redo.clear()
+        # Save current state to undo stack
+        self._history_undo.append(self._working.copy())
+        # Limit history size to prevent memory bloat
+        if len(self._history_undo) > self._history_max_steps:
+            self._history_undo.pop(0)
+
+    def can_undo(self) -> bool:
+        """Check if undo is available."""
+        return len(self._history_undo) > 0
+
+    def can_redo(self) -> bool:
+        """Check if redo is available."""
+        return len(self._history_redo) > 0
+
+    def undo(self) -> None:
+        """Undo last edit."""
+        if not self.can_undo():
+            return
+        # Save current state to redo stack
+        self._history_redo.append(self._working.copy())
+        # Restore previous state
+        self._working = self._history_undo.pop()
+        # Trigger preview update
+        self._schedule_update()
+
+    def redo(self) -> None:
+        """Redo last undone edit."""
+        if not self.can_redo():
+            return
+        # Save current state to undo stack
+        self._history_undo.append(self._working.copy())
+        # Restore next state
+        self._working = self._history_redo.pop()
+        # Trigger preview update
+        self._schedule_update()
+
+    # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
 
     def save_as_new(self) -> str:
+        """Save edited image to local filesystem."""
         result = self._apply_edits(self._working)
         orig = Path(self._item.path)
         ext = orig.suffix.lower()
@@ -1457,6 +1556,33 @@ class EditorView(Gtk.Box):
             dest = orig.parent / f"{orig.stem}_edit_{i}.jpg"
             result.convert("RGB").save(str(dest), "JPEG", quality=95)
         return str(dest)
+
+    def upload_to_nextcloud(self, local_edited_path: str, nextcloud_client) -> bool:
+        """
+        Upload edited local image back to Nextcloud at the original path.
+        Used for cloud-sync workflow.
+        """
+        from .nextcloud import dav_path_from_nc, NC_PATH_PREFIX
+        
+        # Extract DAV path from the original Nextcloud item
+        if not self._item.path.startswith(NC_PATH_PREFIX):
+            return False
+        
+        original_dav_path = dav_path_from_nc(self._item.path)
+        
+        # Replace file extension if needed (e.g., HEIC → JPG)
+        import os
+        original_ext = os.path.splitext(original_dav_path)[0]
+        edited_path = Path(local_edited_path)
+        
+        # Construct the upload path with the same name as original
+        upload_dav_path = original_ext + edited_path.suffix
+        
+        try:
+            return nextcloud_client.upload_file(local_edited_path, upload_dav_path)
+        except Exception as exc:
+            LOGGER.exception("Upload to Nextcloud failed: %s", exc)
+            return False
 
 
 # ---------------------------------------------------------------------------
