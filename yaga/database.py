@@ -9,10 +9,10 @@ from .config import DB_PATH
 from .models import MediaItem
 
 
-SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS media (
     id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
+    path TEXT NOT NULL,
     category TEXT NOT NULL,
     media_type TEXT NOT NULL,
     folder TEXT NOT NULL,
@@ -20,11 +20,36 @@ CREATE TABLE IF NOT EXISTS media (
     mtime REAL NOT NULL,
     size INTEGER NOT NULL,
     thumb_path TEXT,
-    seen_at REAL NOT NULL
+    seen_at REAL NOT NULL,
+    UNIQUE(path, category)
 );
 CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
 CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
 CREATE INDEX IF NOT EXISTS idx_media_mtime ON media(mtime);
+"""
+
+_MIGRATION_V1 = """
+CREATE TABLE media_new (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    category TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mtime REAL NOT NULL,
+    size INTEGER NOT NULL,
+    thumb_path TEXT,
+    seen_at REAL NOT NULL,
+    UNIQUE(path, category)
+);
+INSERT OR IGNORE INTO media_new
+    SELECT id, path, category, media_type, folder, name, mtime, size, thumb_path, seen_at FROM media;
+DROP TABLE media;
+ALTER TABLE media_new RENAME TO media;
+CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
+CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
+CREATE INDEX IF NOT EXISTS idx_media_mtime ON media(mtime);
+PRAGMA user_version = 1;
 """
 
 
@@ -35,7 +60,18 @@ class Database:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         with self.lock:
-            self.conn.executescript(SCHEMA)
+            self.conn.executescript(SCHEMA_V1)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            # Check if old schema (UNIQUE on path alone) is in use
+            info = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='media'"
+            ).fetchone()
+            if info and "UNIQUE(path, category)" not in info["sql"]:
+                self.conn.executescript(_MIGRATION_V1)
 
     def upsert_media(self, *, path: Path, category: str, media_type: str, folder: str, thumb_path: str | None) -> None:
         stat = path.stat()
@@ -44,8 +80,7 @@ class Database:
                 """
                 INSERT INTO media(path, category, media_type, folder, name, mtime, size, thumb_path, seen_at)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(path) DO UPDATE SET
-                    category=excluded.category,
+                ON CONFLICT(path, category) DO UPDATE SET
                     media_type=excluded.media_type,
                     folder=excluded.folder,
                     name=excluded.name,
@@ -55,6 +90,25 @@ class Database:
                     seen_at=excluded.seen_at
                 """,
                 (str(path), category, media_type, folder, path.name, stat.st_mtime, stat.st_size, thumb_path, time.time()),
+            )
+
+    def upsert_remote_media(self, *, path: str, category: str, media_type: str, folder: str,
+                             name: str, mtime: float, size: int, thumb_path: str | None) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO media(path, category, media_type, folder, name, mtime, size, thumb_path, seen_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path, category) DO UPDATE SET
+                    media_type=excluded.media_type,
+                    folder=excluded.folder,
+                    name=excluded.name,
+                    mtime=excluded.mtime,
+                    size=excluded.size,
+                    thumb_path=COALESCE(excluded.thumb_path, media.thumb_path),
+                    seen_at=excluded.seen_at
+                """,
+                (path, category, media_type, folder, name, mtime, size, thumb_path, time.time()),
             )
 
     def prune_missing(self, seen_since: float, categories: list[str]) -> None:
@@ -102,10 +156,13 @@ class Database:
             ).fetchall()
         return [(row["folder"], row["count"], row["thumb"]) for row in rows]
 
-    def child_folders(self, category: str, parent: str | None) -> list[tuple[str, int, str | None]]:
+    def child_folders(self, category: str, parent: str | None) -> list[tuple[str, int, list]]:
         with self.lock:
-            rows = self.conn.execute("SELECT folder, thumb_path FROM media WHERE category = ?", (category,)).fetchall()
-        children: dict[str, tuple[int, str | None]] = {}
+            rows = self.conn.execute(
+                "SELECT folder, thumb_path FROM media WHERE category = ? ORDER BY mtime DESC",
+                (category,),
+            ).fetchall()
+        children: dict[str, tuple[int, list]] = {}
         parent_prefix = "" if parent in (None, "/") else f"{parent}/"
         for row in rows:
             folder = row["folder"]
@@ -121,13 +178,32 @@ class Database:
                 continue
             child_name = remainder.split("/", 1)[0]
             child_path = child_name if parent in (None, "/") else f"{parent}/{child_name}"
-            count, thumb = children.get(child_path, (0, None))
-            children[child_path] = (count + 1, thumb or row["thumb_path"])
-        return [(folder, count, thumb) for folder, (count, thumb) in sorted(children.items(), key=lambda item: item[0].lower())]
+            count, thumbs = children.get(child_path, (0, []))
+            t = row["thumb_path"]
+            if t and t not in thumbs and len(thumbs) < 4:
+                thumbs = thumbs + [t]
+            children[child_path] = (count + 1, thumbs)
+        return [(f, c, t) for f, (c, t) in sorted(children.items(), key=lambda x: x[0].lower())]
 
     def delete_path(self, path: str) -> None:
         with self.lock:
             self.conn.execute("DELETE FROM media WHERE path = ?", (path,))
+            self.conn.commit()
+
+    def clear_category(self, category: str) -> None:
+        """Delete all DB rows for a category and remove their thumbnail files."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT thumb_path FROM media WHERE category = ?", (category,)
+            ).fetchall()
+        for row in rows:
+            if row["thumb_path"]:
+                try:
+                    Path(row["thumb_path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        with self.lock:
+            self.conn.execute("DELETE FROM media WHERE category = ?", (category,))
             self.conn.commit()
 
     def _row_to_item(self, row: sqlite3.Row) -> MediaItem:

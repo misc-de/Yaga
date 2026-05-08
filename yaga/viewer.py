@@ -1,0 +1,683 @@
+from __future__ import annotations
+
+import dataclasses
+import logging
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("GdkPixbuf", "2.0")
+
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
+
+from .editor import EditorView, PILImage, _PIL_OK
+from .models import MediaItem
+from .nextcloud import is_nc_path
+
+LOGGER = logging.getLogger(__name__)
+
+def _fmt_size(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_date(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d  %H:%M")
+
+
+def _image_dimensions(path: str) -> str | None:
+    fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+    if fmt is not None:
+        return f"{w} × {h}"
+    return None
+
+
+class ViewerWindow(Adw.ApplicationWindow):
+    def __init__(self, parent: GalleryWindow, items: list[MediaItem], index: int, external_player: str = "") -> None:
+        super().__init__(application=parent.get_application(), transient_for=parent, title=items[index].name)
+        self.set_default_size(1000, 720)
+        self.parent_window = parent
+        self.items = items
+        self.index = index
+        self.external_player = external_player
+        self.last_gesture_nav_at = 0
+        self.zoom_scale = 1.0
+        self.zoom_start_scale = 1.0
+        self.zoom_view: Gtk.Picture | None = None
+        self.zoom_scroller: Gtk.ScrolledWindow | None = None
+        self._rotation: int = 0
+        self._current_display_path: str | None = None
+        self._current_is_video: bool = False
+        self.toolbar = Adw.ToolbarView()
+        self.set_content(self.toolbar)
+
+        header = Adw.HeaderBar()
+        self.header = header
+        header.set_show_start_title_buttons(False)
+        header.set_show_end_title_buttons(False)
+
+        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        self.close_button.set_tooltip_text(parent._("Close"))
+        self.close_button.connect("clicked", lambda _button: self.close())
+        header.pack_start(self.close_button)
+
+        self.delete_button = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+        self.delete_button.set_tooltip_text(parent._("Delete"))
+        self.delete_button.add_css_class("destructive-action")
+        self.delete_button.connect("clicked", self._confirm_delete_current)
+        self.delete_button.set_visible(False)
+        header.pack_start(self.delete_button)
+
+        self.info_button = Gtk.Button.new_from_icon_name("help-about-symbolic")
+        self.info_button.set_tooltip_text(parent._("Info"))
+        self.info_button.connect("clicked", self._show_info)
+        self.info_button.set_visible(False)
+        header.pack_end(self.info_button)
+
+        self.edit_button = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+        self.edit_button.set_tooltip_text(parent._("Edit"))
+        self.edit_button.connect("clicked", self._enter_edit_mode)
+        self.edit_button.set_visible(False)
+        header.pack_end(self.edit_button)
+
+        self.rotate_button = Gtk.Button.new_from_icon_name("object-rotate-right-symbolic")
+        self.rotate_button.set_tooltip_text(parent._("Rotate clockwise"))
+        self.rotate_button.set_visible(False)
+        self.rotate_button.connect("clicked", self._rotate_clockwise)
+        header.pack_end(self.rotate_button)
+
+        self.cancel_edit_button = Gtk.Button.new_with_label(parent._("Cancel"))
+        self.cancel_edit_button.connect("clicked", self._exit_edit_mode)
+        self.cancel_edit_button.set_visible(False)
+        header.pack_start(self.cancel_edit_button)
+
+        self.save_edit_button = Gtk.Button.new_with_label(parent._("Save"))
+        self.save_edit_button.add_css_class("suggested-action")
+        self.save_edit_button.connect("clicked", self._save_edit)
+        self.save_edit_button.set_visible(False)
+        header.pack_end(self.save_edit_button)
+
+        self.fullscreen_btn = Gtk.Button.new_from_icon_name("view-restore-symbolic")
+        self.fullscreen_btn.set_tooltip_text(parent._("Exit fullscreen"))
+        self.fullscreen_btn.connect("clicked", self._toggle_fullscreen)
+        self.fullscreen_btn.set_visible(False)
+        header.pack_end(self.fullscreen_btn)
+
+        self._editor: EditorView | None = None
+        self.toolbar.add_top_bar(header)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+        self.toolbar.set_content(self.stack)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+        self.swipe_gesture = Gtk.GestureSwipe()
+        self.swipe_gesture.connect("swipe", self._on_swipe)
+        self.stack.add_controller(self.swipe_gesture)
+        self.drag_gesture = Gtk.GestureDrag()
+        self.drag_gesture.connect("drag-end", self._on_drag_end)
+        self.stack.add_controller(self.drag_gesture)
+        self.zoom_gesture = Gtk.GestureZoom()
+        self.zoom_gesture.connect("begin", self._on_zoom_begin)
+        self.zoom_gesture.connect("scale-changed", self._on_zoom_scale_changed)
+        self.stack.add_controller(self.zoom_gesture)
+        self.click_gesture = Gtk.GestureClick()
+        self.click_gesture.connect("pressed", self._on_viewer_pressed)
+        self.stack.add_controller(self.click_gesture)
+        self._set_view_gestures_enabled(True)
+        self.connect("close-request", self._on_close_request)
+        self.fullscreen()
+        self.show_item()
+
+    def show_item(self) -> None:
+        self._set_view_gestures_enabled(True)
+        child = self.stack.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            self.stack.remove(child)
+            child = next_child
+        item = self.items[self.index]
+        self.set_title(item.name)
+        self._reset_zoom()
+        self.zoom_view = None
+        self.zoom_scroller = None
+        self._rotation = 0
+        self._current_display_path = None
+        self._current_is_video = False
+        self.header.set_visible(True)
+        self._set_view_actions_visible(False)
+
+        from .nextcloud import is_nc_path
+        if is_nc_path(item.path):
+            self.info_button.set_visible(True)
+            spinner = Gtk.Spinner()
+            spinner.start()
+            spinner.set_size_request(32, 32)
+            spinner_box = Gtk.Box()
+            spinner_box.set_hexpand(True)
+            spinner_box.set_vexpand(True)
+            spinner_box.set_halign(Gtk.Align.CENTER)
+            spinner_box.set_valign(Gtk.Align.CENTER)
+            spinner_box.append(spinner)
+            self.stack.add_child(spinner_box)
+            threading.Thread(target=self._nc_download_worker, args=(item,), daemon=True).start()
+            return
+
+        if item.is_video:
+            self._current_is_video = True
+            self.delete_button.set_visible(True)
+            self.info_button.set_visible(True)
+            self.fullscreen_btn.set_visible(True)
+            video = Gtk.Video.new_for_file(Gio.File.new_for_path(item.path))
+            video.set_autoplay(True)
+            self.stack.add_child(video)
+            media = video.get_media_stream()
+            if media is not None:
+                media.connect("notify::prepared", self._on_media_prepared)
+        else:
+            self.delete_button.set_visible(True)
+            self.info_button.set_visible(True)
+            self.edit_button.set_visible(_PIL_OK)
+            self.rotate_button.set_visible(True)
+            self._current_display_path = item.path
+            self._show_local_image(item.path)
+
+    def _set_view_actions_visible(self, visible: bool) -> None:
+        self.delete_button.set_visible(visible)
+        self.info_button.set_visible(visible)
+        self.edit_button.set_visible(visible and _PIL_OK and not self._current_is_video)
+        self.rotate_button.set_visible(visible and not self._current_is_video)
+        self.fullscreen_btn.set_visible(visible and self._current_is_video)
+
+    def _set_view_gestures_enabled(self, enabled: bool) -> None:
+        phase = Gtk.PropagationPhase.CAPTURE if enabled else Gtk.PropagationPhase.NONE
+        self.swipe_gesture.set_propagation_phase(phase)
+        self.drag_gesture.set_propagation_phase(phase)
+        self.zoom_gesture.set_propagation_phase(phase)
+        self.click_gesture.set_propagation_phase(phase)
+
+    def _nc_download_worker(self, item) -> None:
+        from .nextcloud import NextcloudClient, dav_path_from_nc
+        settings = self.parent_window.settings
+        pwd = settings.load_app_password()
+        local = None
+        if pwd:
+            try:
+                client = NextcloudClient(settings.nextcloud_url, settings.nextcloud_user, pwd)
+                local = client.download_file(dav_path_from_nc(item.path))
+            except Exception:
+                pass
+        GLib.idle_add(self._nc_show_loaded, item, local)
+
+    def _nc_show_loaded(self, item, local_path: str | None) -> None:
+        child = self.stack.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            self.stack.remove(child)
+            child = next_child
+        if local_path is None:
+            lbl = Gtk.Label(label=self.parent_window._("Could not load file"))
+            lbl.set_hexpand(True)
+            lbl.set_vexpand(True)
+            self.stack.add_child(lbl)
+            return
+        if item.is_video:
+            self._current_is_video = True
+            self.delete_button.set_visible(True)
+            self.info_button.set_visible(True)
+            self.fullscreen_btn.set_visible(True)
+            video = Gtk.Video.new_for_file(Gio.File.new_for_path(local_path))
+            video.set_autoplay(True)
+            self.stack.add_child(video)
+            media = video.get_media_stream()
+            if media is not None:
+                media.connect("notify::prepared", self._on_media_prepared)
+        else:
+            self._current_display_path = local_path
+            self._show_local_image(local_path)
+            self.delete_button.set_visible(False)
+            self.info_button.set_visible(True)
+            self.edit_button.set_visible(_PIL_OK)
+            self.rotate_button.set_visible(True)
+
+    def _show_local_image(self, path: str) -> None:
+        picture = Gtk.Picture.new_for_filename(path)
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(picture)
+        self.zoom_view = picture
+        self.zoom_scroller = scroller
+        self.stack.add_child(scroller)
+
+    def _rotate_clockwise(self, _btn=None) -> None:
+        if self._current_display_path is None:
+            return
+        self._rotation = (self._rotation + 90) % 360
+        child = self.stack.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.stack.remove(child)
+            child = nxt
+        self._reset_zoom()
+        self.zoom_view = None
+        self.zoom_scroller = None
+        spinner = Gtk.Spinner()
+        spinner.start()
+        spinner.set_size_request(32, 32)
+        box = Gtk.Box()
+        box.set_hexpand(True)
+        box.set_vexpand(True)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.append(spinner)
+        self.stack.add_child(box)
+        path = self._current_display_path
+        rotation = self._rotation
+        threading.Thread(
+            target=lambda: self._rotate_worker(path, rotation),
+            daemon=True,
+        ).start()
+
+    def _rotate_worker(self, path: str, rotation: int) -> None:
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            rot_map = {
+                90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+                180: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
+                270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE,
+            }
+            if rotation in rot_map:
+                pixbuf = pixbuf.rotate_simple(rot_map[rotation])
+            GLib.idle_add(self._show_rotated_pixbuf, pixbuf)
+        except Exception as e:
+            LOGGER.exception("Could not rotate image: %s", e)
+            GLib.idle_add(self._show_rotated_pixbuf, None)
+
+    def _show_rotated_pixbuf(self, pixbuf) -> None:
+        child = self.stack.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.stack.remove(child)
+            child = nxt
+        self._reset_zoom()
+        self.zoom_view = None
+        self.zoom_scroller = None
+        if pixbuf is not None:
+            picture = Gtk.Picture.new_for_pixbuf(pixbuf)
+        else:
+            picture = Gtk.Picture.new_for_filename(self._current_display_path or "")
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(picture)
+        self.zoom_view = picture
+        self.zoom_scroller = scroller
+        self.stack.add_child(scroller)
+
+    def _on_media_prepared(self, media_stream, _param=None) -> None:
+        w = media_stream.get_intrinsic_width()
+        h = media_stream.get_intrinsic_height()
+        if w > 0 and h > 0 and w > h:
+            GLib.idle_add(lambda: (self.header.set_visible(False), GLib.SOURCE_REMOVE)[1])
+
+    def _on_close_request(self, _window) -> bool:
+        if self._rotation != 0:
+            self._check_rotation_before_action(self.destroy)
+            return True
+        return False
+
+    def _check_rotation_before_action(self, action) -> None:
+        if self._rotation == 0:
+            action()
+            return
+        _ = self.parent_window._
+        dialog = Adw.AlertDialog(
+            heading=_("Save rotation?"),
+            body=_("The image has been rotated. Save the change?"),
+        )
+        dialog.add_response("discard", _("Discard"))
+        dialog.add_response("save", _("Save"))
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.choose(self, None, self._rotation_dialog_done, action)
+
+    def _rotation_dialog_done(self, dialog, result, action) -> None:
+        response = dialog.choose_finish(result)
+        if response == "cancel":
+            return
+        if response == "save":
+            self._save_rotation()
+        self._rotation = 0
+        action()
+
+    def _save_rotation(self) -> None:
+        path = self._current_display_path
+        if not path or self._rotation == 0:
+            return
+        if _PIL_OK:
+            try:
+                img = PILImage.open(path)
+                img = img.rotate(-self._rotation, expand=True)
+                ext = Path(path).suffix.lower()
+                if ext in (".jpg", ".jpeg"):
+                    img.save(path, quality=95)
+                else:
+                    img.save(path)
+                return
+            except Exception:
+                pass
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            rot_map = {
+                90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+                180: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
+                270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE,
+            }
+            rotated = pixbuf.rotate_simple(rot_map[self._rotation])
+            ext = Path(path).suffix.lower()
+            fmt = "jpeg" if ext in (".jpg", ".jpeg") else "png"
+            rotated.savev(path, fmt, [], [])
+        except Exception:
+            pass
+
+    def _do_previous(self) -> None:
+        if self.items:
+            self.index = (self.index - 1) % len(self.items)
+            self.show_item()
+
+    def _do_next(self) -> None:
+        if self.items:
+            self.index = (self.index + 1) % len(self.items)
+            self.show_item()
+
+    def previous(self) -> None:
+        self._check_rotation_before_action(self._do_previous)
+
+    def next(self) -> None:
+        self._check_rotation_before_action(self._do_next)
+
+    def _on_key(self, _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, _state: Gdk.ModifierType) -> bool:
+        if self._editor is not None:
+            if keyval == Gdk.KEY_Escape:
+                self._exit_edit_mode()
+                return True
+            return False
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_Up):
+            self.previous()
+            return True
+        if keyval in (Gdk.KEY_Right, Gdk.KEY_Down, Gdk.KEY_space):
+            self.next()
+            return True
+        if keyval == Gdk.KEY_F11:
+            self._toggle_fullscreen()
+            return True
+        if keyval == Gdk.KEY_Escape:
+            if self.props.fullscreened:
+                self._toggle_fullscreen()
+            else:
+                self.close()
+            return True
+        return False
+
+    def _on_swipe(self, _gesture: Gtk.GestureSwipe, velocity_x: float, _velocity_y: float) -> None:
+        if self._editor is not None:
+            return
+        self._navigate_from_horizontal_motion(velocity_x, 0)
+
+    def _on_drag_end(self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
+        if self._editor is not None:
+            return
+        self._navigate_from_horizontal_motion(offset_x, offset_y)
+
+    def _navigate_from_horizontal_motion(self, x: float, y: float) -> None:
+        if self.zoom_scale > 1.05:
+            return
+        if abs(x) < 60 or abs(x) <= abs(y):
+            return
+        now = GLib.get_monotonic_time()
+        if now - self.last_gesture_nav_at < 300_000:
+            return
+        self.last_gesture_nav_at = now
+        if x > 0:
+            self.previous()
+        else:
+            self.next()
+
+    def _on_zoom_begin(self, gesture: Gtk.GestureZoom, _sequence) -> None:
+        self.zoom_start_scale = self.zoom_scale
+        self._zoom_anchor: tuple[float, float, float, float] | None = None
+        if self.zoom_scroller:
+            ok, bx, by = gesture.get_bounding_box_center()
+            if ok:
+                hadj = self.zoom_scroller.get_hadjustment()
+                vadj = self.zoom_scroller.get_vadjustment()
+                s = max(self.zoom_scale, 0.01)
+                self._zoom_anchor = (bx, by, (hadj.get_value() + bx) / s, (vadj.get_value() + by) / s)
+
+    def _on_zoom_scale_changed(self, _gesture: Gtk.GestureZoom, scale_delta: float) -> None:
+        self._set_zoom(self.zoom_start_scale * scale_delta)
+        anchor = getattr(self, "_zoom_anchor", None)
+        if self.zoom_scroller and anchor and self.zoom_scale > 1.01:
+            vp_x, vp_y, cx, cy = anchor
+            scale = self.zoom_scale
+            scroller = self.zoom_scroller
+
+            def _apply() -> bool:
+                self._set_adjustment_for_focus(scroller.get_hadjustment(), cx, scale, vp_x)
+                self._set_adjustment_for_focus(scroller.get_vadjustment(), cy, scale, vp_y)
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(_apply)
+
+    def _on_viewer_pressed(self, _gesture: Gtk.GestureClick, n_press: int, _x: float, _y: float) -> None:
+        if self._current_is_video and n_press == 1:
+            self.header.set_visible(not self.header.get_visible())
+        elif not self._current_is_video and n_press == 2:
+            self._reset_zoom()
+
+    def _set_zoom(self, scale: float) -> None:
+        self.zoom_scale = min(max(scale, 1.0), 6.0)
+        self._apply_zoom()
+
+    def _reset_zoom(self) -> None:
+        self.zoom_scale = 1.0
+        self.zoom_start_scale = 1.0
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        if not self.zoom_view or not self.zoom_scroller:
+            return
+        if self.zoom_scale <= 1.01:
+            self.zoom_view.set_size_request(-1, -1)
+            return
+        width = max(self.zoom_scroller.get_width(), self.get_width(), 1)
+        height = max(self.zoom_scroller.get_height(), self.get_height(), 1)
+        self.zoom_view.set_size_request(int(width * self.zoom_scale), int(height * self.zoom_scale))
+
+    def _set_adjustment_for_focus(self, adjustment: Gtk.Adjustment, content_pos: float, scale: float, focus_pos: float) -> None:
+        target = content_pos * scale - focus_pos
+        lower = adjustment.get_lower()
+        upper = max(lower, adjustment.get_upper() - adjustment.get_page_size())
+        adjustment.set_value(min(max(target, lower), upper))
+
+    def _enter_edit_mode(self, _button=None) -> None:
+        if not _PIL_OK:
+            self.parent_window._set_status(self.parent_window._("Could not open editor"))
+            return
+        item = self.items[self.index]
+        if item.is_video:
+            return
+        edit_path = self._current_display_path or item.path
+        if is_nc_path(edit_path) or not Path(edit_path).exists():
+            self.parent_window._set_status(self.parent_window._("Could not open editor"))
+            return
+        edit_item = dataclasses.replace(item, path=edit_path)
+        self._set_view_gestures_enabled(False)
+        self.header.set_show_end_title_buttons(False)
+        self.header.set_show_start_title_buttons(False)
+        self.header.set_visible(True)
+        self.close_button.set_visible(False)
+        self.delete_button.set_visible(False)
+        self.info_button.set_visible(False)
+        self.edit_button.set_visible(False)
+        self.rotate_button.set_visible(False)
+        self.fullscreen_btn.set_visible(False)
+        self.cancel_edit_button.set_visible(True)
+        self.save_edit_button.set_visible(True)
+        child = self.stack.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.stack.remove(child)
+            child = nxt
+        try:
+            self._editor = EditorView(edit_item, self.parent_window._)
+        except Exception as exc:
+            LOGGER.exception("Could not open editor: %s", exc)
+            self.parent_window._set_status(self.parent_window._("Could not open editor"))
+            self._set_view_gestures_enabled(True)
+            self.show_item()
+            return
+        self.stack.add_child(self._editor)
+        self.stack.set_visible_child(self._editor)
+
+    def _exit_edit_mode(self, _button=None) -> None:
+        self._editor = None
+        self._set_view_gestures_enabled(True)
+        self.header.set_show_end_title_buttons(False)
+        self.header.set_show_start_title_buttons(False)
+        self.close_button.set_visible(True)
+        self.cancel_edit_button.set_visible(False)
+        self.save_edit_button.set_visible(False)
+        self.show_item()
+
+    def _save_edit(self, _button: Gtk.Button) -> None:
+        if self._editor is None:
+            return
+        self.save_edit_button.set_sensitive(False)
+        self.cancel_edit_button.set_sensitive(False)
+        editor = self._editor
+        threading.Thread(target=self._save_edit_worker, args=(editor,), daemon=True).start()
+
+    def _save_edit_worker(self, editor) -> None:
+        try:
+            editor.save_as_new()
+            GLib.idle_add(self._save_edit_done, True)
+        except Exception:
+            GLib.idle_add(self._save_edit_done, False)
+
+    def _save_edit_done(self, success: bool) -> None:
+        self.save_edit_button.set_sensitive(True)
+        self.cancel_edit_button.set_sensitive(True)
+        if not success:
+            self.parent_window._set_status(self.parent_window._("Could not save edited image"))
+            return
+        self.parent_window.refresh(scan=True)
+        self._exit_edit_mode()
+
+    def _toggle_fullscreen(self, _btn=None) -> None:
+        if self.props.fullscreened:
+            self.unfullscreen()
+            self.fullscreen_btn.set_icon_name("view-fullscreen-symbolic")
+            self.fullscreen_btn.set_tooltip_text(self.parent_window._("Fullscreen"))
+        else:
+            self.fullscreen()
+            self.fullscreen_btn.set_icon_name("view-restore-symbolic")
+            self.fullscreen_btn.set_tooltip_text(self.parent_window._("Exit fullscreen"))
+
+    def _confirm_delete_current(self, _button: Gtk.Button) -> None:
+        dialog = Adw.AlertDialog(
+            heading=self.parent_window._("Delete media?"),
+            body=self.parent_window._("Delete this item from the gallery?"),
+        )
+        dialog.add_response("cancel", self.parent_window._("Cancel"))
+        dialog.add_response("delete", self.parent_window._("Delete"))
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.choose(self, None, self._delete_dialog_finished, None)
+
+    def _delete_dialog_finished(self, dialog: Adw.AlertDialog, result: Gio.AsyncResult, _data) -> None:
+        if dialog.choose_finish(result) == "delete":
+            self._delete_current_item()
+
+    def _delete_current_item(self) -> None:
+        if not self.items:
+            self.close()
+            return
+        item = self.items[self.index]
+        try:
+            Gio.File.new_for_path(item.path).trash(None)
+        except GLib.Error:
+            self.parent_window._set_status(self.parent_window._("Could not complete action"))
+            return
+        if item.thumb_path:
+            try:
+                Path(item.thumb_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.parent_window.database.delete_path(item.path)
+        self.items.pop(self.index)
+        self.parent_window.refresh(scan=False)
+        if not self.items:
+            self.close()
+            return
+        self.index = min(self.index, len(self.items) - 1)
+        self.show_item()
+
+    def _show_info(self, _button: Gtk.Button) -> None:
+        item = self.items[self.index]
+        _ = self.parent_window._
+
+        rows: list[tuple[str, str]] = [
+            (_("Name"), item.name),
+            (_("Folder"), item.folder),
+            (_("Size"), _fmt_size(item.size)),
+            (_("Modified"), _fmt_date(item.mtime)),
+        ]
+        if not item.is_video:
+            dims = _image_dimensions(item.path)
+            if dims:
+                rows.append((_("Dimensions"), dims))
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(20)
+        grid.set_row_spacing(8)
+        grid.set_margin_top(14)
+        grid.set_margin_bottom(14)
+        grid.set_margin_start(16)
+        grid.set_margin_end(16)
+        for i, (key, value) in enumerate(rows):
+            key_lbl = Gtk.Label(label=key, xalign=1.0)
+            key_lbl.add_css_class("dim-label")
+            val_lbl = Gtk.Label(label=value, xalign=0.0)
+            val_lbl.set_selectable(True)
+            val_lbl.set_wrap(True)
+            val_lbl.set_max_width_chars(32)
+            grid.attach(key_lbl, 0, i, 1, 1)
+            grid.attach(val_lbl, 1, i, 1, 1)
+
+        popover = Gtk.Popover()
+        popover.set_parent(self.info_button)
+        popover.set_child(grid)
+        popover.popup()

@@ -192,45 +192,87 @@ def test_thumbnailer_clear_recreates_cache_dir(tmp_path: Path, monkeypatch) -> N
 
 
 def test_gallery_media_area_is_configured_to_expand() -> None:
-    source = Path("yaga/app.py").read_text(encoding="utf-8")
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
 
-    assert "self.flow.set_vexpand(True)" in source
-    assert "scroller.set_vexpand(True)" in source
-    assert "content.set_vexpand(True)" in source
+    assert "self.grid_view.set_vexpand(True)" in grid_source
+    assert "self.scroller.set_vexpand(True)" in grid_source
+    assert "content.set_vexpand(True)" in app_source
 
 
 def test_gallery_grid_defaults_to_four_compact_media_columns() -> None:
     settings = Settings()
-    source = Path("yaga/app.py").read_text(encoding="utf-8")
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
+    settings_source = Path("yaga/settings_window.py").read_text(encoding="utf-8")
 
     assert settings.grid_columns == 4
-    assert "self.flow.set_column_spacing(2)" in source
-    assert "self.flow.set_row_spacing(2)" in source
-    assert "self.flow.set_halign(Gtk.Align.START)" in source
-    assert "self.flow.set_valign(Gtk.Align.START)" in source
-    assert "self.flow.set_margin_start(0)" in source
-    assert "self.flow.set_margin_end(0)" in source
-    assert "self.flow.set_min_children_per_line(columns)" in source
-    assert "self.flow.set_max_children_per_line(columns)" in source
-    assert "Photos per row" in source
+    assert "from .gallery_grid import GalleryGrid" in app_source
+    assert "self.grid_view.set_min_columns(columns)" in grid_source
+    assert "self.grid_view.set_max_columns(columns)" in grid_source
+    assert "gridview.gallery-grid > child" in app_source
+    assert "padding: 1px;" in app_source
+    assert "Photos per row" in settings_source
 
 
 def test_gallery_tiles_are_sized_from_available_width() -> None:
     source = Path("yaga/app.py").read_text(encoding="utf-8")
 
-    assert "def _calculate_tile_size" in source
-    assert "(columns - 1) * 2" in source
-    assert "tile.set_size_request(self.tile_size, self.tile_size)" in source
-    assert "scroller.add_tick_callback(self._on_grid_tick)" in source
+    assert "def _update_tile_size" in source
+    assert "cell_size = max(32, scroller_width // columns)" in source
+    assert "min-height: {cell_size}px" in source
+    assert "self.gallery_grid.scroller.add_tick_callback(self._on_grid_tick)" in source
 
 
-def test_viewer_has_header_actions_but_no_navigation_buttons() -> None:
+def test_gallery_folder_navigation_uses_swipe_without_visible_back_button() -> None:
     source = Path("yaga/app.py").read_text(encoding="utf-8")
-    viewer_source = source.split("class ViewerWindow", 1)[1]
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
+
+    assert "folder_swipe = Gtk.GestureSwipe()" in source
+    assert 'folder_swipe.connect("swipe", self._on_folder_swipe)' in source
+    assert "swipe = Gtk.GestureSwipe()" in grid_source
+    assert 'swipe.connect("swipe", self._on_tile_swipe)' in grid_source
+    assert "def _on_tile_swipe" in grid_source
+    assert "def _on_folder_swipe" in source
+    assert "if velocity_x > 0:" in source
+    assert "self._go_back_folder()" in source
+    assert "self.back_button.set_visible(False)" in source
+
+
+def test_nextcloud_folder_open_only_syncs_folder_thumbnails() -> None:
+    source = Path("yaga/app.py").read_text(encoding="utf-8")
+    folder_sync_body = source.split("def _nc_folder_sync_bg", 1)[1].split("def _queue_nc_thumb_update", 1)[0]
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
+
+    assert "load_nc_folder_thumbs" in folder_sync_body
+    assert "scan_nc_structure" not in folder_sync_body
+    assert "_nc_folder_sync_generation" in source
+    assert "MediaRow.from_media(updated, row.selected)" in grid_source
+    assert "return True" in grid_source
+
+
+def test_gallery_grid_is_split_out_of_app_module() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
+
+    assert "from .gallery_grid import GalleryGrid" in app_source
+    assert "class MediaRow" not in app_source
+    assert "class GalleryGrid" in grid_source
+    assert "class MediaRow" in grid_source
+
+
+def test_viewer_has_close_header_but_no_navigation_buttons() -> None:
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
 
     assert "Adw.HeaderBar()" in viewer_source
+    assert "header.set_show_start_title_buttons(False)" in viewer_source
+    assert "header.set_show_end_title_buttons(False)" in viewer_source
     assert "window-close-symbolic" in viewer_source
-    assert "user-trash-symbolic" in viewer_source
+    assert "header.pack_start(self.close_button)" in viewer_source
+    assert "header.pack_start(self.delete_button)" in viewer_source
+    assert "header.pack_end(self.info_button)" in viewer_source
+    assert "header.pack_end(self.edit_button)" in viewer_source
+    assert "header.pack_end(self.rotate_button)" in viewer_source
     assert "go-previous-symbolic" not in viewer_source
     assert "go-next-symbolic" not in viewer_source
     assert "Gtk.GestureSwipe()" in viewer_source
@@ -238,33 +280,59 @@ def test_viewer_has_header_actions_but_no_navigation_buttons() -> None:
     assert "Gtk.GestureZoom()" in viewer_source
     assert "Gtk.GestureClick()" in viewer_source
     assert "Gtk.PropagationPhase.CAPTURE" in viewer_source
-    assert 'swipe.connect("swipe", self._on_swipe)' in viewer_source
-    assert 'swipe.connect("end", self._on_swipe)' not in viewer_source
-    assert 'drag.connect("drag-end", self._on_drag_end)' in viewer_source
-    assert 'zoom.connect("scale-changed", self._on_zoom_scale_changed)' in viewer_source
-    assert 'click.connect("pressed", self._on_viewer_pressed)' in viewer_source
+    assert 'self.swipe_gesture.connect("swipe", self._on_swipe)' in viewer_source
+    assert 'connect("end", self._on_swipe)' not in viewer_source
+    assert 'self.drag_gesture.connect("drag-end", self._on_drag_end)' in viewer_source
+    assert 'self.zoom_gesture.connect("scale-changed", self._on_zoom_scale_changed)' in viewer_source
+    assert 'self.click_gesture.connect("pressed", self._on_viewer_pressed)' in viewer_source
     assert "def _navigate_from_horizontal_motion" in viewer_source
 
 
+def test_viewer_exposes_info_edit_and_delete_actions() -> None:
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
+
+    assert 'Gtk.Button.new_from_icon_name("help-about-symbolic")' in viewer_source
+    assert 'Gtk.Button.new_from_icon_name("document-edit-symbolic")' in viewer_source
+    assert 'Gtk.Button.new_from_icon_name("user-trash-symbolic")' in viewer_source
+    assert "self.info_button.set_visible(True)" in viewer_source
+    assert "self.edit_button.set_visible(_PIL_OK)" in viewer_source
+    assert "self.delete_button.set_visible(True)" in viewer_source
+    assert "def _show_info" in viewer_source
+    assert "def _enter_edit_mode" in viewer_source
+    assert "edit_path = self._current_display_path or item.path" in viewer_source
+    assert "edit_item = dataclasses.replace(item, path=edit_path)" in viewer_source
+    assert "EditorView(edit_item, self.parent_window._)" in viewer_source
+    assert "self.stack.set_visible_child(self._editor)" in viewer_source
+    assert 'LOGGER.exception("Could not open editor: %s", exc)' in viewer_source
+
+
+def test_viewer_disables_own_gestures_in_editor_mode() -> None:
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
+
+    assert "def _set_view_gestures_enabled" in viewer_source
+    assert "Gtk.PropagationPhase.NONE" in viewer_source
+    assert "self._set_view_gestures_enabled(False)" in viewer_source
+    assert "self._set_view_gestures_enabled(True)" in viewer_source
+
+
 def test_viewer_supports_pinch_zoom_and_double_tap_reset() -> None:
-    source = Path("yaga/app.py").read_text(encoding="utf-8")
-    viewer_source = source.split("class ViewerWindow", 1)[1]
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
 
     assert "self.zoom_scale = 1.0" in viewer_source
     assert "self.zoom_start_scale = 1.0" in viewer_source
     assert "self.zoom_view.set_size_request(int(width * self.zoom_scale), int(height * self.zoom_scale))" in viewer_source
     assert "self.zoom_view.set_size_request(-1, -1)" in viewer_source
     assert "self._set_zoom(self.zoom_start_scale * scale_delta)" in viewer_source
-    assert "self._keep_zoom_focus(old_scale, self.zoom_scale, focus_x, focus_y)" in viewer_source
     assert "gesture.get_bounding_box_center()" in viewer_source
-    assert "if n_press == 2:" in viewer_source
+    assert "self._zoom_anchor" in viewer_source
+    assert "self._set_adjustment_for_focus(scroller.get_hadjustment(), cx, scale, vp_x)" in viewer_source
+    assert "n_press == 2" in viewer_source
     assert "self._reset_zoom()" in viewer_source
     assert "if self.zoom_scale > 1.05:" in viewer_source
 
 
 def test_viewer_delete_uses_confirmation_and_cleans_index_and_thumbnail() -> None:
-    source = Path("yaga/app.py").read_text(encoding="utf-8")
-    viewer_source = source.split("class ViewerWindow", 1)[1]
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
 
     assert "Adw.AlertDialog" in viewer_source
     assert "Adw.ResponseAppearance.DESTRUCTIVE" in viewer_source
@@ -272,3 +340,54 @@ def test_viewer_delete_uses_confirmation_and_cleans_index_and_thumbnail() -> Non
     assert "Path(item.thumb_path).unlink(missing_ok=True)" in viewer_source
     assert "self.parent_window.database.delete_path(item.path)" in viewer_source
     assert "self.parent_window.refresh(scan=False)" in viewer_source
+
+
+def test_editor_is_split_out_of_app_module() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    editor_source = Path("yaga/editor.py").read_text(encoding="utf-8")
+
+    assert "from .editor import EditorView, PILImage, _PIL_OK" not in app_source
+    assert "class EditorView" not in app_source
+    assert "class EditorView" in editor_source
+    assert "def __init__(self, item: MediaItem, translate=None)" in editor_source
+    assert "def _(self, text: str) -> str" in editor_source
+
+
+def test_editor_frames_are_decorative_not_plain_color_bands() -> None:
+    from yaga.editor import _FRAME_THEMES, _frame_pil
+
+    frame = _frame_pil(240, 180, "christmas")
+    assert frame is not None
+    assert frame.getpixel((120, 90))[3] == 0
+
+    edge_pixels = [
+        frame.getpixel((x, y))
+        for x in range(6, 234, 8)
+        for y in list(range(6, 42, 6)) + list(range(138, 174, 6))
+        if frame.getpixel((x, y))[3] > 0
+    ]
+    assert len(set(edge_pixels)) > 4
+
+    source = Path("yaga/editor.py").read_text(encoding="utf-8")
+    assert "_decorate_christmas" in source
+    assert "_decorate_winter" in source
+    assert len(_FRAME_THEMES) >= 8
+
+
+def test_settings_window_is_split_out_of_app_module() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    settings_source = Path("yaga/settings_window.py").read_text(encoding="utf-8")
+
+    assert "from .settings_window import SettingsWindow" in app_source
+    assert "class SettingsWindow" not in app_source
+    assert "class SettingsWindow" in settings_source
+
+
+def test_viewer_is_split_out_of_app_module() -> None:
+    app_source = Path("yaga/app.py").read_text(encoding="utf-8")
+    viewer_source = Path("yaga/viewer.py").read_text(encoding="utf-8")
+
+    assert "from .viewer import ViewerWindow" in app_source
+    assert "class ViewerWindow" not in app_source
+    assert "class ViewerWindow" in viewer_source
+    assert "from .editor import EditorView, PILImage, _PIL_OK" in viewer_source

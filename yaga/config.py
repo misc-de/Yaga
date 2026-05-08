@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "yaga"
@@ -34,11 +36,19 @@ class Settings:
     screenshots_dir: str = field(default_factory=lambda: default_path("screenshots"))
     extra_locations: list[str] = field(default_factory=list)
     sort_mode: str = "newest"
+    sort_modes: dict = field(default_factory=dict)
     theme: str = "system"
     language: str = "system"
     external_video_player: str = ""
     grid_columns: int = 4
     last_category: str = ""
+
+    # Nextcloud — stored in keyring; only URL/user saved to settings.json
+    nextcloud_url: str = ""
+    nextcloud_user: str = ""
+    nextcloud_photos_path: str = "Photos"
+    nextcloud_enabled: bool = False  # set to True after successful connect
+    nextcloud_thumbnail_only: bool = True  # skip full-file download during scan
 
     @classmethod
     def load(cls) -> "Settings":
@@ -49,8 +59,8 @@ class Settings:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return cls()
-        known = {field.name for field in cls.__dataclass_fields__.values()}
-        settings = cls(**{key: value for key, value in data.items() if key in known})
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        settings = cls(**{k: v for k, v in data.items() if k in known})
         settings.grid_columns = min(max(int(settings.grid_columns), 2), 10)
         return settings
 
@@ -59,11 +69,177 @@ class Settings:
         path = CONFIG_DIR / "settings.json"
         path.write_text(json.dumps(self.__dict__, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def get_sort_mode(self, category: str) -> str:
+        default = "folder" if category == "nextcloud" else self.sort_mode
+        return self.sort_modes.get(category, default)
+
     def categories(self) -> list[tuple[str, str, str]]:
-        return [
-            ("photos", "Photos", self.photos_dir),
-            ("pictures", "Pictures", self.pictures_dir),
-            ("videos", "Videos", self.videos_dir),
+        cats: list[tuple[str, str, str]] = [
+            ("pictures",    "Pictures",    self.pictures_dir),
+            ("photos",      "Photos",      self.photos_dir),
+            ("videos",      "Videos",      self.videos_dir),
             ("screenshots", "Screenshots", self.screenshots_dir),
-            *[(f"location:{i}", Path(path).name or "Locations", path) for i, path in enumerate(self.extra_locations)],
+            *[(f"location:{i}", Path(p).name or "Locations", p)
+              for i, p in enumerate(self.extra_locations)],
         ]
+        if self.nextcloud_enabled and self.nextcloud_url and self.nextcloud_user:
+            cats.append(("nextcloud", "Nextcloud", self.nextcloud_photos_path or "Photos"))
+        return cats
+
+    # ------------------------------------------------------------------
+    # Nextcloud helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Ensure URL has a scheme; default to https:// when missing."""
+        url = url.strip().rstrip("/")
+        if not url:
+            return ""
+        if not re.match(r"^https?://", url):
+            url = "https://" + url
+        return url
+
+    def nextcloud_webdav_url(self, app_password: str) -> str:
+        """davs:// URL used with gio mount (always HTTPS unless user forced http://)."""
+        if not self.nextcloud_url or not self.nextcloud_user:
+            return ""
+        base = self._normalize_url(self.nextcloud_url)
+        host = re.sub(r"^https?://", "", base).split("/")[0]
+        # Only use plain dav:// when the user explicitly typed http://
+        scheme = "dav" if self.nextcloud_url.strip().startswith("http://") else "davs"
+        pwd = quote(app_password, safe="")
+        return (
+            f"{scheme}://{self.nextcloud_user}:{pwd}@{host}"
+            f"/remote.php/dav/files/{self.nextcloud_user}/"
+        )
+
+    def nextcloud_local_path(self) -> str:
+        """Return the GVFS path for the configured Photos folder, or ''."""
+        if not self.nextcloud_url or not self.nextcloud_user:
+            return ""
+        gvfs = Path(f"/run/user/{os.getuid()}/gvfs")
+        if not gvfs.exists():
+            return ""
+        host = re.sub(r"^https?://", "", self.nextcloud_url.strip()).split("/")[0]
+        for entry in sorted(gvfs.iterdir()):
+            n = entry.name
+            if "dav" not in n:
+                continue
+            if host not in n and self.nextcloud_user not in n:
+                continue
+            sub = entry / "files" / self.nextcloud_user / self.nextcloud_photos_path
+            try:
+                exists = sub.exists()
+            except OSError:
+                # PermissionError from GVFS FUSE means the mount IS there —
+                # os.stat raises EACCES instead of ENOENT for an existing FUSE path
+                exists = True
+            if exists:
+                return str(sub)
+        return ""
+
+    def nextcloud_available_folders(self) -> list[str]:
+        """Return top-level folder names inside the Nextcloud mount (for error feedback)."""
+        if not self.nextcloud_url or not self.nextcloud_user:
+            return []
+        gvfs = Path(f"/run/user/{os.getuid()}/gvfs")
+        if not gvfs.exists():
+            return []
+        host = re.sub(r"^https?://", "", self.nextcloud_url.strip()).split("/")[0]
+        for entry in sorted(gvfs.iterdir()):
+            n = entry.name
+            if "dav" not in n:
+                continue
+            if host not in n and self.nextcloud_user not in n:
+                continue
+            files_root = entry / "files" / self.nextcloud_user
+            try:
+                return sorted(p.name for p in files_root.iterdir() if p.is_dir())
+            except OSError:
+                return []
+        return []
+
+    # ------------------------------------------------------------------
+    # App-password keyring helpers (libsecret, falls back to nothing)
+    # ------------------------------------------------------------------
+
+    _KEYRING_SCHEMA = "de.furilabs.yaga.nextcloud"
+    _CRED_FILE = CONFIG_DIR / "nc_password"
+
+    def save_app_password(self, password: str) -> bool:
+        """Store app-password. Tries system keyring first, falls back to a 0600 file."""
+        try:
+            import gi; gi.require_version("Secret", "1")
+            from gi.repository import Secret
+            schema = Secret.Schema.new(
+                self._KEYRING_SCHEMA, Secret.SchemaFlags.NONE,
+                {"server": Secret.SchemaAttributeType.STRING,
+                 "user":   Secret.SchemaAttributeType.STRING},
+            )
+            ok = Secret.password_store_sync(
+                schema,
+                {"server": self.nextcloud_url, "user": self.nextcloud_user},
+                Secret.COLLECTION_DEFAULT,
+                "Yaga – Nextcloud App-Passwort",
+                password,
+                None,
+            )
+            if ok:
+                return True
+        except Exception:
+            pass
+        # Fallback: plain file with restricted permissions
+        try:
+            self._CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._CRED_FILE.write_text(password, encoding="utf-8")
+            self._CRED_FILE.chmod(0o600)
+            return True
+        except Exception:
+            return False
+
+    def load_app_password(self) -> str:
+        """Retrieve app-password. Tries system keyring first, falls back to file."""
+        try:
+            import gi; gi.require_version("Secret", "1")
+            from gi.repository import Secret
+            schema = Secret.Schema.new(
+                self._KEYRING_SCHEMA, Secret.SchemaFlags.NONE,
+                {"server": Secret.SchemaAttributeType.STRING,
+                 "user":   Secret.SchemaAttributeType.STRING},
+            )
+            result = Secret.password_lookup_sync(
+                schema,
+                {"server": self.nextcloud_url, "user": self.nextcloud_user},
+                None,
+            )
+            if result:
+                return result
+        except Exception:
+            pass
+        # Fallback: file
+        try:
+            return self._CRED_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def clear_app_password(self) -> None:
+        try:
+            import gi; gi.require_version("Secret", "1")
+            from gi.repository import Secret
+            schema = Secret.Schema.new(
+                self._KEYRING_SCHEMA, Secret.SchemaFlags.NONE,
+                {"server": Secret.SchemaAttributeType.STRING,
+                 "user":   Secret.SchemaAttributeType.STRING},
+            )
+            Secret.password_clear_sync(
+                schema,
+                {"server": self.nextcloud_url, "user": self.nextcloud_user},
+                None,
+            )
+        except Exception:
+            pass
+        try:
+            self._CRED_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass

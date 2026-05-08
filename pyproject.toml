@@ -4,11 +4,23 @@ version = "0.1.0"
 description = "GTK4/libadwaita gallery app"
 requires-python = ">=3.11"
 dependencies = [
+    "Pillow>=10.0",
+    "pycairo>=1.25",
+    "PyGObject>=3.46",
 ]
 
 [project.scripts]
 yaga = "yaga.__main__:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+yaga = [
+    "data/icons/hicolor/128x128/apps/*.png",
+    "data/icons/hicolor/scalable/apps/*.svg",
+    "data/icons/*.png",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
-
