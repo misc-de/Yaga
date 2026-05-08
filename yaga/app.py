@@ -168,11 +168,6 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.settings_button.connect("clicked", self._open_settings)
         self.header.pack_start(self.settings_button)
 
-        self.help_button = Gtk.Button.new_from_icon_name("help-about-symbolic")
-        self.help_button.set_tooltip_text(self._("Privacy & Help"))
-        self.help_button.connect("clicked", self._show_privacy_info)
-        self.header.pack_start(self.help_button)
-
         self.sort_button = Gtk.MenuButton(icon_name="view-sort-descending-symbolic")
         self.sort_button.set_tooltip_text(self._("Sort"))
         self.sort_button.set_popover(self._sort_popover())
