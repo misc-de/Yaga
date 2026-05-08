@@ -249,7 +249,7 @@ def test_gallery_tiles_are_sized_from_available_width() -> None:
     source = Path("yaga/app.py").read_text(encoding="utf-8")
 
     assert "def _update_tile_size" in source
-    assert "cell_size = max(32, scroller_width // columns)" in source
+    assert "cell_size = max(32, scroller_width // columns)" in source  # height only; width handled by homogeneous Box
     assert "min-height: {cell_size}px" in source
     assert "self.gallery_grid.scroller.add_tick_callback(self._on_grid_tick)" in source
 
