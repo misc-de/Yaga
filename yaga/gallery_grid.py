@@ -229,7 +229,7 @@ class GalleryGrid(Gtk.Overlay):
         # ── Tile row widget ──────────────────────────────────────────
         tile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         tile_box.set_hexpand(True)
-        tile_box.set_homogeneous(False)
+        tile_box.set_homogeneous(True)
 
         tile_buttons: list[Gtk.Button] = []
         for i in range(_MAX_COLS):
@@ -303,7 +303,7 @@ class GalleryGrid(Gtk.Overlay):
         button = Gtk.Button()
         button.add_css_class("flat")
         button.add_css_class("gallery-tile")
-        button.set_hexpand(False)
+        button.set_hexpand(True)
         button.set_vexpand(True)
         button.set_child(overlay)
 

@@ -825,7 +825,7 @@ class GalleryWindow(Adw.ApplicationWindow):
         # Each cell has 1px padding on each side → 2px per cell
         cell_size = max(32, scroller_width // columns)
         self._tile_css.load_from_data(
-            f".gallery-tile {{ min-width: {cell_size}px; min-height: {cell_size}px; }}".encode()
+            f".gallery-tile {{ min-height: {cell_size}px; }}".encode()
         )
 
     def _load_css(self) -> None:
