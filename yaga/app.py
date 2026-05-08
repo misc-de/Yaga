@@ -169,8 +169,8 @@ class GalleryWindow(Adw.ApplicationWindow):
                 self._("You don't have permission to access this file."),
                 f"Path: {file_path}" if file_path else ""
             )
-        elif isinstance(error, OSError) as ose:
-            details = str(ose) if str(ose) else ""
+        elif isinstance(error, OSError):
+            details = str(error) if str(error) else ""
             self._show_error_dialog(
                 self._("System error"),
                 self._("Could not access the file due to a system error."),
