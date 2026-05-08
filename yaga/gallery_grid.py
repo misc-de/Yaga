@@ -260,25 +260,25 @@ class GalleryGrid(Gtk.Overlay):
     def _make_tile_button(self, tile_index: int, list_item: Gtk.ListItem) -> Gtk.Button:
         single_pic = Gtk.Picture()
         single_pic.set_content_fit(Gtk.ContentFit.COVER)
-        single_pic.set_hexpand(True)
-        single_pic.set_vexpand(True)
+        single_pic.set_hexpand(False)
+        single_pic.set_vexpand(False)
 
         pic_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        pic_row1.set_vexpand(True)
+        pic_row1.set_vexpand(False)
         pic_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        pic_row2.set_vexpand(True)
+        pic_row2.set_vexpand(False)
         preview_pics: list[Gtk.Picture] = []
         for i in range(4):
             picture = Gtk.Picture()
             picture.set_content_fit(Gtk.ContentFit.COVER)
-            picture.set_hexpand(True)
-            picture.set_vexpand(True)
+            picture.set_hexpand(False)
+            picture.set_vexpand(False)
             preview_pics.append(picture)
             (pic_row1 if i < 2 else pic_row2).append(picture)
 
         pic_grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        pic_grid.set_hexpand(True)
-        pic_grid.set_vexpand(True)
+        pic_grid.set_hexpand(False)
+        pic_grid.set_vexpand(False)
         pic_grid.append(pic_row1)
         pic_grid.append(pic_row2)
         pic_grid.set_visible(False)
@@ -302,8 +302,8 @@ class GalleryGrid(Gtk.Overlay):
         check.set_visible(False)
 
         overlay = Gtk.Overlay()
-        overlay.set_hexpand(False)
-        overlay.set_vexpand(False)
+        overlay.set_hexpand(True)
+        overlay.set_vexpand(True)
         overlay.set_child(single_pic)
         overlay.add_overlay(pic_grid)
         overlay.add_overlay(badge)
@@ -313,6 +313,8 @@ class GalleryGrid(Gtk.Overlay):
         button = Gtk.Button()
         button.add_css_class("flat")
         button.add_css_class("gallery-tile")
+        button.set_hexpand(False)
+        button.set_vexpand(False)
         button.set_child(overlay)
 
         button._single_pic = single_pic        # type: ignore[attr-defined]
