@@ -195,6 +195,7 @@ class GalleryWindow(Adw.ApplicationWindow):
         # Virtualized grid (GridView only renders visible tiles)
         self.gallery_grid = GalleryGrid(self)
         self.gallery_grid.scroller.add_tick_callback(self._on_grid_tick)
+        self.gallery_grid.scroller.connect("edge-overshot", self._on_scroll_edge_overshot)
         scroll_refresh = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
         scroll_refresh.connect("scroll", self._on_pull_refresh_scroll)
         self.gallery_grid.scroller.add_controller(scroll_refresh)
@@ -431,6 +432,7 @@ class GalleryWindow(Adw.ApplicationWindow):
                 self.gallery_grid.append_media(item, item.path in self._selected_paths)
             self._set_status("")
             self.gallery_grid.set_empty(self._("No pictures found"), not self.current_items)
+        self.gallery_grid.finish()
 
         if saved_pos > 0:
             def _restore() -> bool:
@@ -797,13 +799,24 @@ class GalleryWindow(Adw.ApplicationWindow):
             self._update_tile_size(width)
         return GLib.SOURCE_CONTINUE
 
+    def _on_scroll_edge_overshot(self, _scroller, pos: Gtk.PositionType) -> None:
+        if pos == Gtk.PositionType.TOP:
+            self._trigger_pull_refresh()
+
     def _on_pull_refresh_scroll(self, _controller: Gtk.EventControllerScroll, _dx: float, dy: float) -> bool:
         adjustment = self.gallery_grid.get_vadjustment()
         if dy < -0.8 and adjustment.get_value() <= adjustment.get_lower() + 1:
-            LOGGER.info("Pull refresh triggered")
-            self.refresh(scan=True)
+            self._trigger_pull_refresh()
             return True
         return False
+
+    def _trigger_pull_refresh(self) -> None:
+        if not self.refresh_button.get_sensitive():
+            return
+        LOGGER.info("Pull refresh triggered")
+        self.gallery_grid.pull_revealer.set_reveal_child(True)
+        self.refresh(scan=True)
+        GLib.timeout_add(1200, lambda: self.gallery_grid.pull_revealer.set_reveal_child(False) or False)
 
     def _update_tile_size(self, scroller_width: int) -> None:
         if scroller_width <= 0:
@@ -812,7 +825,7 @@ class GalleryWindow(Adw.ApplicationWindow):
         # Each cell has 1px padding on each side → 2px per cell
         cell_size = max(32, scroller_width // columns)
         self._tile_css.load_from_data(
-            f"gridview.gallery-grid > child {{ min-height: {cell_size}px; }}".encode()
+            f".gallery-tile {{ min-height: {cell_size}px; }}".encode()
         )
 
     def _load_css(self) -> None:
@@ -821,7 +834,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             b"""
             .gallery-tile {
                 padding: 0;
-                margin: 0;
+                margin: 1px;
                 border-radius: 0;
                 min-width: 0;
                 min-height: 0;
@@ -829,13 +842,19 @@ class GalleryWindow(Adw.ApplicationWindow):
             .gallery-tile > * {
                 margin: 0;
             }
-            .gallery-tile.date-header {
-                background: transparent;
-                opacity: 1;
-                font-weight: 700;
+            listview.gallery-list > row {
+                padding: 0;
             }
-            gridview.gallery-grid > child {
-                padding: 1px;
+            listview.gallery-list > row:hover,
+            listview.gallery-list > row:selected {
+                background: transparent;
+            }
+            .date-section-header {
+                min-height: 30px;
+                padding: 0 4px;
+                background: rgba(0,0,0,0.45);
+                color: white;
+                font-weight: 700;
             }
             .view-switcher {
                 border-top: 1px solid @borders;

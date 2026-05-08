@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from .app import GalleryWindow
 
 
+_MAX_COLS = 10  # maximum supported grid columns
+
+
 class MediaRow(GObject.Object):
     """One cell in the gallery grid: either a folder or a media item."""
 
@@ -28,7 +31,6 @@ class MediaRow(GObject.Object):
         self.folder_path: str | None = None
         self.folder_count: int = 0
         self.folder_thumbs: list[str] = []
-        self.header_text: str | None = None
         self.selected: bool = False
 
     @classmethod
@@ -46,19 +48,34 @@ class MediaRow(GObject.Object):
         row.folder_thumbs = thumbs
         return row
 
-    @classmethod
-    def from_header(cls, text: str) -> "MediaRow":
-        row = cls()
-        row.header_text = text
-        return row
-
     @property
     def is_folder(self) -> bool:
         return self.folder_path is not None
 
-    @property
-    def is_header(self) -> bool:
-        return self.header_text is not None
+
+class GalleryRow(GObject.Object):
+    """One row in the gallery list: either a date-section header or a row of tiles."""
+
+    __gtype_name__ = "YagaGalleryRow"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.is_header: bool = False
+        self.header_text: str = ""
+        self.tiles: list[MediaRow] = []
+
+    @classmethod
+    def header(cls, text: str) -> "GalleryRow":
+        row = cls()
+        row.is_header = True
+        row.header_text = text
+        return row
+
+    @classmethod
+    def from_tiles(cls, tiles: list[MediaRow]) -> "GalleryRow":
+        row = cls()
+        row.tiles = list(tiles)
+        return row
 
 
 class GalleryGrid(Gtk.Overlay):
@@ -68,24 +85,28 @@ class GalleryGrid(Gtk.Overlay):
         self.set_hexpand(True)
         self.set_vexpand(True)
 
-        self.item_store = Gio.ListStore(item_type=MediaRow)
+        self._cols = 4
+        self._building_row: list[MediaRow] = []
+
+        self.row_store = Gio.ListStore(item_type=GalleryRow)
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._on_item_setup)
         factory.connect("bind", self._on_item_bind)
         factory.connect("unbind", self._on_item_unbind)
 
-        self.grid_view = Gtk.GridView()
-        self.grid_view.set_model(Gtk.NoSelection(model=self.item_store))
-        self.grid_view.set_factory(factory)
-        self.grid_view.add_css_class("gallery-grid")
-        self.grid_view.set_hexpand(True)
-        self.grid_view.set_vexpand(True)
+        self.list_view = Gtk.ListView()
+        self.list_view.set_model(Gtk.NoSelection(model=self.row_store))
+        self.list_view.set_factory(factory)
+        self.list_view.add_css_class("gallery-list")
+        self.list_view.set_hexpand(True)
+        self.list_view.set_vexpand(True)
+        self.list_view.set_show_separators(False)
 
         self.scroller = Gtk.ScrolledWindow()
         self.scroller.set_hexpand(True)
         self.scroller.set_vexpand(True)
         self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.scroller.set_child(self.grid_view)
+        self.scroller.set_child(self.list_view)
 
         self.empty_label = Gtk.Label()
         self.empty_label.set_halign(Gtk.Align.CENTER)
@@ -94,26 +115,55 @@ class GalleryGrid(Gtk.Overlay):
         self.empty_label.add_css_class("title-3")
         self.empty_label.set_visible(False)
 
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(28, 28)
+        spinner.start()
+        pull_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        pull_box.set_halign(Gtk.Align.CENTER)
+        pull_box.set_valign(Gtk.Align.START)
+        pull_box.set_margin_top(8)
+        pull_box.append(spinner)
+        self.pull_revealer = Gtk.Revealer()
+        self.pull_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.pull_revealer.set_transition_duration(180)
+        self.pull_revealer.set_child(pull_box)
+        self.pull_revealer.set_halign(Gtk.Align.CENTER)
+        self.pull_revealer.set_valign(Gtk.Align.START)
+        self.pull_revealer.set_reveal_child(False)
+
         self.set_child(self.scroller)
+        self.add_overlay(self.pull_revealer)
         self.add_overlay(self.empty_label)
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def set_columns(self, columns: int) -> None:
-        columns = min(max(int(columns), 2), 10)
-        self.grid_view.set_min_columns(columns)
-        self.grid_view.set_max_columns(columns)
+        self._cols = min(max(int(columns), 2), _MAX_COLS)
 
     def clear(self) -> None:
-        self.item_store.remove_all()
+        self.row_store.remove_all()
+        self._building_row = []
         self.empty_label.set_visible(False)
 
+    def finish(self) -> None:
+        """Flush the last partial tile row. Call after all append_* calls."""
+        self._flush_tile_row()
+
     def append_folder(self, folder: str, count: int, thumbs: list[str]) -> None:
-        self.item_store.append(MediaRow.from_folder(folder, count, thumbs))
+        self._building_row.append(MediaRow.from_folder(folder, count, thumbs))
+        if len(self._building_row) >= self._cols:
+            self._flush_tile_row()
 
     def append_media(self, item: MediaItem, selected: bool = False) -> None:
-        self.item_store.append(MediaRow.from_media(item, selected))
+        self._building_row.append(MediaRow.from_media(item, selected))
+        if len(self._building_row) >= self._cols:
+            self._flush_tile_row()
 
     def append_header(self, text: str) -> None:
-        self.item_store.append(MediaRow.from_header(text))
+        self._flush_tile_row()
+        self.row_store.append(GalleryRow.header(text))
 
     def set_empty(self, text: str, visible: bool) -> None:
         self.empty_label.set_label(text)
@@ -123,26 +173,81 @@ class GalleryGrid(Gtk.Overlay):
         return self.scroller.get_vadjustment()
 
     def update_item_thumb(self, path: str, thumb_path: str) -> bool:
-        n = self.item_store.get_n_items()
+        n = self.row_store.get_n_items()
         for pos in range(n):
-            row = self.item_store.get_item(pos)
-            if not row.is_folder and row.media_item and row.media_item.path == path:
-                updated = dataclasses.replace(row.media_item, thumb_path=thumb_path)
-                self.item_store.splice(pos, 1, [MediaRow.from_media(updated, row.selected)])
-                return True
+            gallery_row = self.row_store.get_item(pos)
+            if gallery_row.is_header:
+                continue
+            for j, tile in enumerate(gallery_row.tiles):
+                if not tile.is_folder and tile.media_item and tile.media_item.path == path:
+                    new_tiles = gallery_row.tiles[:]
+                    new_tiles[j] = MediaRow.from_media(
+                        dataclasses.replace(tile.media_item, thumb_path=thumb_path),
+                        tile.selected,
+                    )
+                    self.row_store.splice(pos, 1, [GalleryRow.from_tiles(new_tiles)])
+                    return True
         return False
 
     def update_folder_thumb(self, folder_path: str, thumb_path: str) -> bool:
-        n = self.item_store.get_n_items()
+        n = self.row_store.get_n_items()
         for pos in range(n):
-            row = self.item_store.get_item(pos)
-            if row.is_folder and row.folder_path == folder_path:
-                thumbs = [thumb_path, *[thumb for thumb in row.folder_thumbs if thumb != thumb_path]][:4]
-                self.item_store.splice(pos, 1, [MediaRow.from_folder(row.folder_path, row.folder_count, thumbs)])
-                return True
+            gallery_row = self.row_store.get_item(pos)
+            if gallery_row.is_header:
+                continue
+            for j, tile in enumerate(gallery_row.tiles):
+                if tile.is_folder and tile.folder_path == folder_path:
+                    thumbs = [thumb_path, *[t for t in tile.folder_thumbs if t != thumb_path]][:4]
+                    new_tiles = gallery_row.tiles[:]
+                    new_tiles[j] = MediaRow.from_folder(tile.folder_path, tile.folder_count, thumbs)
+                    self.row_store.splice(pos, 1, [GalleryRow.from_tiles(new_tiles)])
+                    return True
         return False
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _flush_tile_row(self) -> None:
+        if self._building_row:
+            self.row_store.append(GalleryRow.from_tiles(self._building_row))
+            self._building_row = []
+
+    # ------------------------------------------------------------------
+    # Factory callbacks
+    # ------------------------------------------------------------------
+
     def _on_item_setup(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
+        # ── Header widget ────────────────────────────────────────────
+        header_lbl = Gtk.Label()
+        header_lbl.set_halign(Gtk.Align.FILL)
+        header_lbl.set_xalign(0.0)
+        header_lbl.set_hexpand(True)
+        header_lbl.set_margin_start(10)
+        header_lbl.add_css_class("date-section-header")
+
+        # ── Tile row widget ──────────────────────────────────────────
+        tile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        tile_box.set_hexpand(True)
+        tile_box.set_homogeneous(True)
+
+        tile_buttons: list[Gtk.Button] = []
+        for i in range(_MAX_COLS):
+            btn = self._make_tile_button(i, list_item)
+            tile_box.append(btn)
+            tile_buttons.append(btn)
+
+        # ── Stack switching between header and tiles ─────────────────
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        stack.add_named(header_lbl, "header")
+        stack.add_named(tile_box, "tiles")
+        stack._header_lbl = header_lbl       # type: ignore[attr-defined]
+        stack._tile_buttons = tile_buttons   # type: ignore[attr-defined]
+
+        list_item.set_child(stack)
+
+    def _make_tile_button(self, tile_index: int, list_item: Gtk.ListItem) -> Gtk.Button:
         single_pic = Gtk.Picture()
         single_pic.set_content_fit(Gtk.ContentFit.COVER)
         single_pic.set_hexpand(True)
@@ -208,16 +313,17 @@ class GalleryGrid(Gtk.Overlay):
         button._badge = badge                  # type: ignore[attr-defined]
         button._folder_label = folder_label    # type: ignore[attr-defined]
         button._check = check                  # type: ignore[attr-defined]
-        button._overlay = overlay              # type: ignore[attr-defined]
+        button._tile_index = tile_index        # type: ignore[attr-defined]
+        button._current_item: MediaRow | None = None  # type: ignore[attr-defined]
 
         button.connect("clicked", self._on_tile_clicked, list_item)
 
         gesture = Gtk.GestureClick(button=3)
-        gesture.connect("pressed", self._on_tile_right_click, list_item)
+        gesture.connect("pressed", self._on_tile_right_click, list_item, tile_index)
         button.add_controller(gesture)
 
         long_press = Gtk.GestureLongPress()
-        long_press.connect("pressed", self._on_tile_long_press, list_item)
+        long_press.connect("pressed", self._on_tile_long_press, list_item, tile_index)
         button.add_controller(long_press)
 
         swipe = Gtk.GestureSwipe()
@@ -225,36 +331,35 @@ class GalleryGrid(Gtk.Overlay):
         swipe.connect("swipe", self._on_tile_swipe)
         button.add_controller(swipe)
 
-        list_item.set_child(button)
+        return button
 
     def _on_item_bind(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
-        row: MediaRow = list_item.get_item()
-        button = list_item.get_child()
+        gallery_row: GalleryRow = list_item.get_item()
+        stack = list_item.get_child()
+
+        if gallery_row.is_header:
+            stack.set_visible_child_name("header")
+            stack._header_lbl.set_label(gallery_row.header_text)
+            return
+
+        stack.set_visible_child_name("tiles")
+        icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        for i, btn in enumerate(stack._tile_buttons):
+            if i < len(gallery_row.tiles):
+                btn.set_visible(True)
+                self._bind_tile(btn, gallery_row.tiles[i], icon_theme)
+            else:
+                btn.set_visible(False)
+                btn._current_item = None
+
+    def _bind_tile(self, button: Gtk.Button, row: MediaRow, icon_theme) -> None:
+        button._current_item = row
         single_pic: Gtk.Picture = button._single_pic
         preview_pics: list[Gtk.Picture] = button._preview_pics
         pic_grid: Gtk.Widget = button._pic_grid
         badge: Gtk.Image = button._badge
         folder_label: Gtk.Label = button._folder_label
         check: Gtk.Image = button._check
-        icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-
-        if row.is_header:
-            single_pic.set_visible(False)
-            pic_grid.set_visible(False)
-            badge.set_visible(False)
-            check.set_visible(False)
-            folder_label.set_label(row.header_text or "")
-            folder_label.set_halign(Gtk.Align.START)
-            folder_label.set_valign(Gtk.Align.CENTER)
-            folder_label.set_visible(True)
-            button.set_sensitive(False)
-            button.add_css_class("date-header")
-            return
-
-        button.set_sensitive(True)
-        button.remove_css_class("date-header")
-        folder_label.set_halign(Gtk.Align.FILL)
-        folder_label.set_valign(Gtk.Align.END)
 
         if row.is_folder:
             valid_thumbs = [t for t in row.folder_thumbs if t and Path(t).exists()]
@@ -282,15 +387,18 @@ class GalleryGrid(Gtk.Overlay):
                     )
             label = row.folder_path.rsplit("/", 1)[-1] if row.folder_path != "/" else "/"
             folder_label.set_label(label)
+            folder_label.set_halign(Gtk.Align.FILL)
+            folder_label.set_valign(Gtk.Align.END)
             folder_label.set_visible(True)
             badge.set_visible(False)
             check.set_visible(False)
+            button.set_sensitive(True)
             return
 
-        single_pic.set_visible(True)
-        pic_grid.set_visible(False)
         item = row.media_item
         assert item is not None
+        single_pic.set_visible(True)
+        pic_grid.set_visible(False)
         if item.thumb_path and Path(item.thumb_path).exists():
             single_pic.set_filename(item.thumb_path)
         elif is_nc_path(item.path):
@@ -314,16 +422,31 @@ class GalleryGrid(Gtk.Overlay):
                 check.remove_css_class("checked")
         else:
             check.set_visible(False)
+        button.set_sensitive(True)
 
     def _on_item_unbind(self, _factory: Gtk.SignalListItemFactory, list_item: Gtk.ListItem) -> None:
-        button = list_item.get_child()
-        button._single_pic.set_paintable(None)
-        for picture in button._preview_pics:
-            picture.set_paintable(None)
+        stack = list_item.get_child()
+        for btn in stack._tile_buttons:
+            btn._single_pic.set_paintable(None)
+            btn._current_item = None
+            for picture in btn._preview_pics:
+                picture.set_paintable(None)
 
-    def _on_tile_clicked(self, _button: Gtk.Button, list_item: Gtk.ListItem) -> None:
-        row: MediaRow | None = list_item.get_item()
-        if row is None or row.is_header:
+    # ------------------------------------------------------------------
+    # Gesture / click callbacks
+    # ------------------------------------------------------------------
+
+    def _get_tile_item(self, list_item: Gtk.ListItem, tile_index: int) -> MediaRow | None:
+        gallery_row: GalleryRow | None = list_item.get_item()
+        if gallery_row is None or gallery_row.is_header:
+            return None
+        if tile_index >= len(gallery_row.tiles):
+            return None
+        return gallery_row.tiles[tile_index]
+
+    def _on_tile_clicked(self, button: Gtk.Button, list_item: Gtk.ListItem) -> None:
+        row = button._current_item
+        if row is None:
             return
         if self.owner._selection_mode:
             if not row.is_folder and row.media_item is not None:
@@ -341,15 +464,24 @@ class GalleryGrid(Gtk.Overlay):
         x: float,
         y: float,
         list_item: Gtk.ListItem,
+        tile_index: int,
     ) -> None:
-        row: MediaRow | None = list_item.get_item()
-        if row is None or row.is_folder or row.is_header:
+        row = self._get_tile_item(list_item, tile_index)
+        if row is None or row.is_folder:
             return
-        self.owner._show_context_menu(gesture, 1, x, y, row.media_item, list_item.get_child())
+        widget = gesture.get_widget()
+        self.owner._show_context_menu(gesture, 1, x, y, row.media_item, widget)
 
-    def _on_tile_long_press(self, _gesture, _x, _y, list_item: Gtk.ListItem) -> None:
-        row: MediaRow | None = list_item.get_item()
-        if row is None or row.is_folder or row.is_header or row.media_item is None:
+    def _on_tile_long_press(
+        self,
+        _gesture,
+        _x,
+        _y,
+        list_item: Gtk.ListItem,
+        tile_index: int,
+    ) -> None:
+        row = self._get_tile_item(list_item, tile_index)
+        if row is None or row.is_folder or row.media_item is None:
             return
         if not self.owner._selection_mode:
             self.owner._enter_selection_mode()

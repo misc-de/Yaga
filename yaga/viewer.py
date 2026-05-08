@@ -88,11 +88,6 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.edit_button.set_visible(False)
         header.pack_end(self.edit_button)
 
-        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
-        self.close_button.set_tooltip_text(parent._("Close"))
-        self.close_button.connect("clicked", lambda _button: self.close())
-        header.pack_end(self.close_button)
-
         self.cancel_edit_button = Gtk.Button.new_with_label(parent._("Cancel"))
         self.cancel_edit_button.connect("clicked", self._exit_edit_mode)
         self.cancel_edit_button.set_visible(False)
@@ -109,6 +104,11 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.fullscreen_btn.connect("clicked", self._toggle_fullscreen)
         self.fullscreen_btn.set_visible(False)
         header.pack_end(self.fullscreen_btn)
+
+        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        self.close_button.set_tooltip_text(parent._("Close"))
+        self.close_button.connect("clicked", lambda _button: self.close())
+        header.pack_end(self.close_button)
 
         self._editor: EditorView | None = None
         self.toolbar.add_top_bar(header)
