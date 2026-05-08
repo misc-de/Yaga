@@ -64,6 +64,36 @@ def test_database_sort_modes(tmp_path: Path) -> None:
     assert [item.name for item in db.list_media("photos", "name")] == ["a-older.jpg", "b-newer.jpg"]
 
 
+def test_database_delete_path_is_category_scoped(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    shared = tmp_path / "shared.jpg"
+    shared.write_bytes(b"img")
+
+    db.upsert_media(path=shared, category="photos", media_type="image", folder="/", thumb_path=None)
+    db.upsert_media(path=shared, category="pictures", media_type="image", folder="/", thumb_path=None)
+    db.commit()
+
+    db.delete_path(str(shared), category="photos")
+
+    assert db.list_media("photos") == []
+    assert [item.name for item in db.list_media("pictures")] == ["shared.jpg"]
+
+
+def test_database_get_media_by_path_is_category_scoped(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    shared = tmp_path / "shared.jpg"
+    shared.write_bytes(b"img")
+
+    db.upsert_media(path=shared, category="photos", media_type="image", folder="/", thumb_path="t1.jpg")
+    db.upsert_media(path=shared, category="pictures", media_type="image", folder="/", thumb_path="t2.jpg")
+    db.commit()
+
+    item = db.get_media_by_path(str(shared), category="pictures")
+    assert item is not None
+    assert item.thumb_path == "t2.jpg"
+    assert item.category == "pictures"
+
+
 def test_scanner_indexes_media_recursively_and_ignores_non_media(tmp_path: Path) -> None:
     db = Database(tmp_path / "test.sqlite3")
     root = tmp_path / "Pictures"
@@ -378,7 +408,7 @@ def test_viewer_delete_uses_confirmation_and_cleans_index_and_thumbnail() -> Non
     assert "Adw.ResponseAppearance.DESTRUCTIVE" in viewer_source
     assert "Gio.File.new_for_path(item.path).trash(None)" in viewer_source
     assert "Path(item.thumb_path).unlink(missing_ok=True)" in viewer_source
-    assert "self.parent_window.database.delete_path(item.path)" in viewer_source
+    assert "self.parent_window.database.delete_path(item.path, item.category)" in viewer_source
     assert "self.parent_window.refresh(scan=False)" in viewer_source
 
 

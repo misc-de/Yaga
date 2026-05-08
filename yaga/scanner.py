@@ -134,7 +134,7 @@ class MediaScanner:
             thumb = client.ensure_thumbnail(dav)
             if thumb:
                 loaded += 1
-                self.database.set_thumb(item.path, thumb)
+                self.database.set_thumb(item.path, thumb, "nextcloud")
                 on_thumb_loaded(item.path, thumb)
         self.database.commit()
         LOGGER.info(

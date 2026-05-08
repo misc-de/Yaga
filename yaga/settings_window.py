@@ -178,10 +178,10 @@ class SettingsWindow(Adw.PreferencesWindow):
         self._nc_status_row.set_title(text)
         self._nc_status_row.set_visible(True)
         icon = "emblem-ok-symbolic" if ok else "dialog-warning-symbolic"
-        # remove old prefix icons
-        child = self._nc_status_row.get_child()
-        img = Gtk.Image.new_from_icon_name(icon)
-        self._nc_status_row.add_prefix(img)
+        if hasattr(self, "_nc_status_icon") and self._nc_status_icon is not None:
+            self._nc_status_row.remove(self._nc_status_icon)
+        self._nc_status_icon = Gtk.Image.new_from_icon_name(icon)
+        self._nc_status_row.add_prefix(self._nc_status_icon)
 
     def _nc_connect(self, _btn: Gtk.Button) -> None:
         url  = self._nc_url_row.get_text().strip()

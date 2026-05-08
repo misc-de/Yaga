@@ -118,9 +118,15 @@ class Database:
         with self.lock:
             self.conn.execute(f"DELETE FROM media WHERE seen_at < ? AND category IN ({placeholders})", [seen_since, *categories])
 
-    def set_thumb(self, path: str, thumb_path: str) -> None:
+    def set_thumb(self, path: str, thumb_path: str, category: str | None = None) -> None:
         with self.lock:
-            self.conn.execute("UPDATE media SET thumb_path = ? WHERE path = ?", (thumb_path, path))
+            if category is not None:
+                self.conn.execute(
+                    "UPDATE media SET thumb_path = ? WHERE path = ? AND category = ?",
+                    (thumb_path, path, category),
+                )
+            else:
+                self.conn.execute("UPDATE media SET thumb_path = ? WHERE path = ?", (thumb_path, path))
 
     def commit(self) -> None:
         with self.lock:
@@ -142,9 +148,14 @@ class Database:
             rows = self.conn.execute(f"SELECT * FROM media WHERE {where} ORDER BY {order}", args).fetchall()
         return [self._row_to_item(row) for row in rows]
 
-    def get_media_by_path(self, path: str) -> MediaItem | None:
+    def get_media_by_path(self, path: str, category: str | None = None) -> MediaItem | None:
         with self.lock:
-            row = self.conn.execute("SELECT * FROM media WHERE path = ?", (path,)).fetchone()
+            if category is not None:
+                row = self.conn.execute(
+                    "SELECT * FROM media WHERE path = ? AND category = ?", (path, category)
+                ).fetchone()
+            else:
+                row = self.conn.execute("SELECT * FROM media WHERE path = ?", (path,)).fetchone()
         return self._row_to_item(row) if row else None
 
     def folders(self, category: str) -> list[tuple[str, int, str | None]]:
@@ -190,9 +201,14 @@ class Database:
             children[child_path] = (count + 1, thumbs)
         return [(f, c, t) for f, (c, t) in sorted(children.items(), key=lambda x: x[0].lower())]
 
-    def delete_path(self, path: str) -> None:
+    def delete_path(self, path: str, category: str | None = None) -> None:
         with self.lock:
-            self.conn.execute("DELETE FROM media WHERE path = ?", (path,))
+            if category is not None:
+                self.conn.execute(
+                    "DELETE FROM media WHERE path = ? AND category = ?", (path, category)
+                )
+            else:
+                self.conn.execute("DELETE FROM media WHERE path = ?", (path,))
             self.conn.commit()
 
     def clear_category(self, category: str) -> None:

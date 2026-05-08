@@ -70,8 +70,12 @@ class Settings:
         path = CONFIG_DIR / "settings.json"
         path.write_text(json.dumps(self.__dict__, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def get_sort_mode(self, category: str) -> str:
+    def get_sort_mode(self, category: str, folder: str | None = None) -> str:
         default = "folder" if category == "nextcloud" else self.sort_mode
+        if folder is not None:
+            folder_key = f"{category}\x00{folder}"
+            if folder_key in self.sort_modes:
+                return self.sort_modes[folder_key]
         return self.sort_modes.get(category, default)
 
     def categories(self) -> list[tuple[str, str, str]]:

@@ -15,10 +15,10 @@ from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
 from .models import MediaItem
 
 try:
-    from PIL import Image as PILImage, ImageEnhance, ImageOps, ImageDraw
+    from PIL import Image as PILImage, ImageEnhance, ImageFilter, ImageOps, ImageDraw
     _PIL_OK = True
 except ImportError:
-    PILImage = ImageEnhance = ImageOps = ImageDraw = None
+    PILImage = ImageEnhance = ImageFilter = ImageOps = ImageDraw = None
     _PIL_OK = False
 
 # ---------------------------------------------------------------------------
@@ -520,6 +520,12 @@ class EditorView(Gtk.Box):
         # text sticker
         self._text_color: tuple = (255, 255, 255)
 
+        # obfuscate (blur brush)
+        self._obfuscate_mode: bool = False
+        self._obfuscate_strokes: list[tuple[float, float, float]] = []
+        self._obfuscate_brush_size: float = 0.08
+        self._obfuscate_drag_origin: tuple[float, float] | None = None
+
         self._active_panel: str | None = None
         self._update_id: int | None = None
         self._nav_handler_ids: dict[str, int] = {}
@@ -573,8 +579,8 @@ class EditorView(Gtk.Box):
         self._panel_stack.set_transition_type(Gtk.StackTransitionType.NONE)
         self._panel_stack.set_vhomogeneous(False)
         self._panel_stack.add_named(self._build_panel_filter(), "filter")
-        self._panel_stack.add_named(self._build_panel_brightness(), "brightness")
-        self._panel_stack.add_named(self._build_panel_colors(), "colors")
+        self._panel_stack.add_named(self._build_panel_adjust(), "adjust")
+        self._panel_stack.add_named(self._build_panel_effects(), "effects")
         self._panel_stack.add_named(self._build_panel_sticker(), "sticker")
         self._panel_stack.add_named(self._build_panel_crop(), "crop")
 
@@ -592,11 +598,11 @@ class EditorView(Gtk.Box):
 
         self._nav_btns: dict[str, Gtk.ToggleButton] = {}
         for key, icon, label in [
-            ("filter",     "image-filter-symbolic",       "Filter"),
-            ("brightness", "display-brightness-symbolic", "Helligkeit"),
-            ("colors",     "preferences-color-symbolic",  "Farben"),
-            ("sticker",    "face-smile-symbolic",         "Sticker"),
-            ("crop",       "crop-symbolic",               "Zuschneiden"),
+            ("filter",   "image-filter-symbolic",       "Filter"),
+            ("adjust",   "display-brightness-symbolic", "Anpassen"),
+            ("effects",  "image-adjust-symbolic",       "Effekte"),
+            ("sticker",  "face-smile-symbolic",         "Sticker"),
+            ("crop",     "crop-symbolic",               "Zuschneiden"),
         ]:
             inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             inner.set_margin_top(6)
@@ -672,41 +678,22 @@ class EditorView(Gtk.Box):
         scroll.set_child(row)
         return scroll
 
-    def _build_panel_brightness(self) -> Gtk.Widget:
+    def _build_panel_adjust(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_start(12)
         box.set_margin_end(12)
         box.set_margin_top(6)
         box.set_margin_bottom(6)
-        for attr, label in [("_brightness", "Brightness"), ("_contrast", "Contrast")]:
+        for attr, label in [
+            ("_brightness", "Brightness"),
+            ("_contrast",   "Contrast"),
+            ("_red",        "Red"),
+            ("_green",      "Green"),
+            ("_blue",       "Blue"),
+        ]:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             l = Gtk.Label(label=label, xalign=0)
-            l.set_size_request(90, -1)
-            sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05)
-            sc.set_value(getattr(self, attr))
-            sc.set_hexpand(True)
-            sc.set_draw_value(False)
-            sc.connect("value-changed", self._on_slider, attr)
-            reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
-            reset.add_css_class("flat")
-            reset.set_tooltip_text("Reset")
-            reset.connect("clicked", self._reset_slider, attr, sc)
-            row.append(l)
-            row.append(sc)
-            row.append(reset)
-            box.append(row)
-        return box
-
-    def _build_panel_colors(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
-        box.set_margin_top(10)
-        box.set_margin_bottom(10)
-        for attr, label in [("_red", "Red"), ("_green", "Green"), ("_blue", "Blue")]:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            l = Gtk.Label(label=label, xalign=0)
-            l.set_size_request(60, -1)
+            l.set_size_request(80, -1)
             sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05)
             sc.set_value(getattr(self, attr))
             sc.set_hexpand(True)
@@ -952,6 +939,36 @@ class EditorView(Gtk.Box):
         box.append(self._crop_reset_btn)
         return box
 
+    def _build_panel_effects(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        obf_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._obfuscate_btn = Gtk.ToggleButton(label="✎  Verwischen")
+        self._obfuscate_btn.set_hexpand(True)
+        self._obfuscate_btn.connect("toggled", self._on_obfuscate_toggled)
+        obf_reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+        obf_reset.add_css_class("flat")
+        obf_reset.set_tooltip_text("Pinselstriche zurücksetzen")
+        obf_reset.connect("clicked", self._reset_obfuscate)
+        obf_row.append(self._obfuscate_btn)
+        obf_row.append(obf_reset)
+        box.append(obf_row)
+        size_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        size_lbl = Gtk.Label(label="Pinselgröße", xalign=0)
+        size_lbl.set_size_request(100, -1)
+        self._obfuscate_size_sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.02, 0.25, 0.01)
+        self._obfuscate_size_sc.set_value(self._obfuscate_brush_size)
+        self._obfuscate_size_sc.set_hexpand(True)
+        self._obfuscate_size_sc.set_draw_value(False)
+        self._obfuscate_size_sc.connect("value-changed", self._on_obfuscate_size_changed)
+        size_row.append(size_lbl)
+        size_row.append(self._obfuscate_size_sc)
+        box.append(size_row)
+        return box
+
     # ------------------------------------------------------------------
     # Nav toggle
     # ------------------------------------------------------------------
@@ -963,16 +980,32 @@ class EditorView(Gtk.Box):
                     b.handler_block(self._nav_handler_ids[k])
                     b.set_active(False)
                     b.handler_unblock(self._nav_handler_ids[k])
-            if key != "crop":
+            if key not in ("crop", "effects"):
                 self._deactivate_crop()
+            if key != "effects":
+                self._deactivate_obfuscate()
             self._active_panel = key
             self._panel_stack.set_visible_child_name(key)
             self._panel_revealer.set_reveal_child(True)
+            if key == "sticker":
+                active_cat = next(
+                    (k for k, b in self._sticker_cat_btns.items() if b.get_active()),
+                    "smileys",
+                )
+                self._sticker_sub_stack.set_visible_child_name(active_cat)
+                self._sticker_sub_revealer.set_reveal_child(True)
+                if not self._sticker_cat_btns[active_cat].get_active():
+                    sticker_btn = self._sticker_cat_btns[active_cat]
+                    sticker_btn.handler_block(self._sticker_cat_hids[active_cat])
+                    sticker_btn.set_active(True)
+                    sticker_btn.handler_unblock(self._sticker_cat_hids[active_cat])
         else:
             self._active_panel = None
             self._panel_revealer.set_reveal_child(False)
             if key == "crop":
                 self._deactivate_crop()
+            if key == "effects":
+                self._deactivate_obfuscate()
 
     def _deactivate_crop(self) -> None:
         self._crop_mode = False
@@ -983,6 +1016,15 @@ class EditorView(Gtk.Box):
         self._crop_start = self._crop_current = None
         self._crop_rect_disp = None
         self._crop_active_handle = None
+        self._draw_area.queue_draw()
+
+    def _deactivate_obfuscate(self) -> None:
+        self._obfuscate_mode = False
+        self._obfuscate_drag_origin = None
+        if hasattr(self, "_obfuscate_btn"):
+            self._obfuscate_btn.handler_block_by_func(self._on_obfuscate_toggled)
+            self._obfuscate_btn.set_active(False)
+            self._obfuscate_btn.handler_unblock_by_func(self._on_obfuscate_toggled)
         self._draw_area.queue_draw()
 
     # ------------------------------------------------------------------
@@ -1105,6 +1147,10 @@ class EditorView(Gtk.Box):
 
     def _on_drag_begin(self, _g: Gtk.GestureDrag, x: float, y: float) -> None:
         self._drag_sticker = False
+        if self._obfuscate_mode:
+            self._obfuscate_drag_origin = (x, y)
+            self._add_obfuscate_stroke(x, y)
+            return
         if self._crop_mode:
             handle = self._hit_crop_handle(x, y)
             if handle:
@@ -1126,6 +1172,10 @@ class EditorView(Gtk.Box):
             self._drag_sx, self._drag_sy = x, y
 
     def _on_drag_update(self, _g: Gtk.GestureDrag, ox: float, oy: float) -> None:
+        if self._obfuscate_mode and self._obfuscate_drag_origin is not None:
+            bx, by = self._obfuscate_drag_origin
+            self._add_obfuscate_stroke(bx + ox, by + oy)
+            return
         if self._crop_mode:
             if self._crop_active_handle and self._crop_handle_orig:
                 x1, y1, x2, y2 = self._crop_handle_orig
@@ -1146,6 +1196,10 @@ class EditorView(Gtk.Box):
             self._move_sticker(self._drag_sx + ox, self._drag_sy + oy)
 
     def _on_drag_end(self, _g: Gtk.GestureDrag, ox: float, oy: float) -> None:
+        if self._obfuscate_mode:
+            self._obfuscate_drag_origin = None
+            self._schedule_update()
+            return
         if self._crop_mode:
             if self._crop_active_handle and self._crop_rect_disp:
                 rect = self._display_to_image(*self._crop_rect_disp)
@@ -1183,6 +1237,31 @@ class EditorView(Gtk.Box):
             max(0.0, min(1.0, (py - oy) / (ih * scale))),
         )
         self._store_active_sticker()
+        self._schedule_update()
+
+    def _add_obfuscate_stroke(self, px: float, py: float) -> None:
+        dw = self._draw_area.get_width()
+        dh = self._draw_area.get_height()
+        iw, ih = self._working.size
+        if dw <= 0 or dh <= 0:
+            return
+        scale = min(dw / iw, dh / ih)
+        ox = (dw - iw * scale) / 2
+        oy = (dh - ih * scale) / 2
+        rel_x = (px - ox) / (iw * scale)
+        rel_y = (py - oy) / (ih * scale)
+        self._obfuscate_strokes.append((rel_x, rel_y, self._obfuscate_brush_size))
+        self._draw_area.queue_draw()
+
+    def _on_obfuscate_toggled(self, btn: Gtk.ToggleButton) -> None:
+        self._obfuscate_mode = btn.get_active()
+        self._draw_area.queue_draw()
+
+    def _on_obfuscate_size_changed(self, sc: Gtk.Scale) -> None:
+        self._obfuscate_brush_size = sc.get_value()
+
+    def _reset_obfuscate(self, _btn: Gtk.Button) -> None:
+        self._obfuscate_strokes = []
         self._schedule_update()
 
     def _display_to_image(
@@ -1273,6 +1352,19 @@ class EditorView(Gtk.Box):
             cr.line_to(del_cx - d, del_cy + d)
             cr.stroke()
 
+        if self._obfuscate_strokes and width > 0 and height > 0:
+            iw, ih = self._working.size
+            scale = min(width / iw, height / ih)
+            ox = (width - iw * scale) / 2
+            oy = (height - ih * scale) / 2
+            for rel_x, rel_y, rel_r in self._obfuscate_strokes:
+                cx = ox + rel_x * iw * scale
+                cy = oy + rel_y * ih * scale
+                r = max(4.0, rel_r * min(iw, ih) * scale)
+                cr.set_source_rgba(0.15, 0.45, 0.90, 0.22)
+                cr.arc(cx, cy, r, 0, 2 * math.pi)
+                cr.fill()
+
     # ------------------------------------------------------------------
     # Image processing
     # ------------------------------------------------------------------
@@ -1305,6 +1397,18 @@ class EditorView(Gtk.Box):
                 sy = int(rel[1] * ih - si.height / 2)
                 canvas.paste(si, (sx, sy), si if si.mode == "RGBA" else None)
             result = PILImage.alpha_composite(result.convert("RGBA"), canvas).convert("RGB")
+        if self._obfuscate_strokes:
+            iw2, ih2 = result.size
+            blurred = result.filter(ImageFilter.GaussianBlur(radius=max(4, iw2 // 40)))
+            obf_mask = PILImage.new("L", (iw2, ih2), 0)
+            obf_draw = ImageDraw.Draw(obf_mask)
+            for rel_x, rel_y, rel_r in self._obfuscate_strokes:
+                cx = int(rel_x * iw2)
+                cy = int(rel_y * ih2)
+                r = max(4, int(rel_r * min(iw2, ih2)))
+                obf_draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+            obf_mask = obf_mask.filter(ImageFilter.GaussianBlur(radius=6))
+            result = PILImage.composite(blurred.convert("RGB"), result.convert("RGB"), obf_mask)
         if self._frame_theme is not None:
             iw, ih = result.size
             frame = _frame_pil(iw, ih, self._frame_theme)

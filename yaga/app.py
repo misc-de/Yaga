@@ -400,7 +400,7 @@ class GalleryWindow(Adw.ApplicationWindow):
 
     def _update_item_thumb(self, path: str, thumb_path: str) -> None:
         updated = self.gallery_grid.update_item_thumb(path, thumb_path)
-        item = self.database.get_media_by_path(path)
+        item = self.database.get_media_by_path(path, "nextcloud")
         if item is not None:
             folder_path = self._visible_child_folder_for_item(item.folder)
             if folder_path is not None:
@@ -418,7 +418,7 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.gallery_grid.clear()
         self.current_items = []
 
-        sort_mode = self.settings.get_sort_mode(self.category)
+        sort_mode = self.settings.get_sort_mode(self.category, self.current_folder)
         self.back_button.set_visible(False)
         if sort_mode == "folder":
             self._render_folders()
@@ -441,7 +441,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             GLib.idle_add(_restore, priority=GLib.PRIORITY_HIGH_IDLE)
 
     def _render_folders(self) -> None:
-        sort_mode = self.settings.get_sort_mode(self.category)
+        sort_mode = self.settings.get_sort_mode(self.category, self.current_folder)
         folders = self.database.child_folders(self.category, self.current_folder)
         for folder, count, thumbs in folders:
             self.gallery_grid.append_folder(folder, count, thumbs)
@@ -456,7 +456,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         self._set_status("")
 
     def _render_date_groups(self) -> None:
-        granularity = self._date_group_modes.get(self.category, "day")
+        date_key = f"{self.category}\x00{self.current_folder or '/'}"
+        granularity = self._date_group_modes.get(date_key, "day")
         self.current_items = self.database.list_media(
             self.category, "newest", self.current_folder
         )
@@ -545,7 +546,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             subprocess.Popen(shlex.split(self.settings.external_video_player) + [item.path])
             return
         items = self.current_items or self.database.list_media(
-            item.category, self.settings.get_sort_mode(item.category), self.current_folder
+            item.category, self.settings.get_sort_mode(item.category, self.current_folder), self.current_folder
         )
         ViewerWindow(self, items, items.index(item), self.settings.external_video_player).present()
 
@@ -649,7 +650,7 @@ class GalleryWindow(Adw.ApplicationWindow):
         for path in paths:
             try:
                 Gio.File.new_for_path(path).trash(None)
-                self.database.delete_path(path)
+                self.database.delete_path(path, self.category)
             except GLib.Error:
                 pass
         self._exit_selection_mode()
@@ -673,7 +674,7 @@ class GalleryWindow(Adw.ApplicationWindow):
                 try:
                     target = Path(folder) / Path(path).name
                     Path(path).rename(target)
-                    self.database.delete_path(path)
+                    self.database.delete_path(path, self.category)
                 except OSError:
                     errors += 1
             self._exit_selection_mode()
@@ -684,7 +685,7 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _delete_item(self, item: MediaItem) -> None:
         try:
             Gio.File.new_for_path(item.path).trash(None)
-            self.database.delete_path(item.path)
+            self.database.delete_path(item.path, item.category)
             self._render()
             self._set_status(self._("Deleted"))
         except GLib.Error:
@@ -704,7 +705,7 @@ class GalleryWindow(Adw.ApplicationWindow):
             target = Path(folder) / item.name
             try:
                 Path(item.path).rename(target)
-                self.database.delete_path(item.path)
+                self.database.delete_path(item.path, item.category)
                 self.refresh(scan=True)
                 self._set_status(self._("Moved"))
             except OSError:
@@ -761,17 +762,18 @@ class GalleryWindow(Adw.ApplicationWindow):
             self._go_back_folder()
 
     def _set_sort_mode(self, _button: Gtk.Button, mode: str, popover: Gtk.Popover) -> None:
+        sort_key = f"{self.category}\x00{self.current_folder}" if self.current_folder is not None else self.category
         if mode == "date":
-            current_mode = self.settings.sort_modes.get(self.category)
+            current_mode = self.settings.sort_modes.get(sort_key)
             order = ["day", "week", "month", "year"]
-            current_group = self._date_group_modes.get(self.category, "day")
+            date_key = f"{self.category}\x00{self.current_folder or '/'}"
+            current_group = self._date_group_modes.get(date_key, "day")
             if current_mode == "date":
                 current_group = order[(order.index(current_group) + 1) % len(order)]
-            self._date_group_modes[self.category] = current_group
+            self._date_group_modes[date_key] = current_group
             self._set_status(self._date_group_label(time.time(), current_group).split(" · ")[0])
-        self.settings.sort_modes[self.category] = mode
+        self.settings.sort_modes[sort_key] = mode
         self.settings.save()
-        self.current_folder = None
         popover.popdown()
         self._render()
 

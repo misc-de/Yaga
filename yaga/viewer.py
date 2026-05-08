@@ -39,6 +39,53 @@ def _image_dimensions(path: str) -> str | None:
     return None
 
 
+def _extract_exif(path: str) -> dict[str, str]:
+    """Extract camera model and GPS coords from EXIF, if available."""
+    exif_info: dict[str, str] = {}
+    if not _PIL_OK or PILImage is None:
+        return exif_info
+    try:
+        from PIL.Image import Exif
+        img = PILImage.open(path)
+        exif_data = img.getexif()
+        if not exif_data:
+            return exif_info
+        # Tag 271: Make, Tag 272: Model
+        make = exif_data.get(271, "").strip()
+        model = exif_data.get(272, "").strip()
+        camera = ""
+        if make and model:
+            camera = f"{make} {model}"
+        elif model:
+            camera = model
+        elif make:
+            camera = make
+        if camera:
+            exif_info["Camera"] = camera
+        # Tag 34853: GPS IFD Pointer → parse GPS tags
+        if 34853 in exif_data:
+            gps_ifd = exif_data.get_ifd(34853)
+            # GPS Latitude (Tag 2), Longitude (Tag 4)
+            lat_data = gps_ifd.get(2)
+            lon_data = gps_ifd.get(4)
+            lat_ref = gps_ifd.get(1, "N")  # N/S
+            lon_ref = gps_ifd.get(3, "E")  # E/W
+            if lat_data and lon_data:
+                try:
+                    lat = float(lat_data[0]) + float(lat_data[1]) / 60 + float(lat_data[2]) / 3600
+                    lon = float(lon_data[0]) + float(lon_data[1]) / 60 + float(lon_data[2]) / 3600
+                    if lat_ref == "S":
+                        lat = -lat
+                    if lon_ref == "W":
+                        lon = -lon
+                    exif_info["GPS"] = f"{lat:.4f}, {lon:.4f}"
+                except (TypeError, IndexError, ZeroDivisionError):
+                    pass
+    except Exception:
+        pass
+    return exif_info
+
+
 class ViewerWindow(Adw.ApplicationWindow):
     def __init__(self, parent: GalleryWindow, items: list[MediaItem], index: int, external_player: str = "") -> None:
         super().__init__(application=parent.get_application(), transient_for=parent, title=items[index].name)
@@ -62,6 +109,11 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.header = header
         header.set_show_start_title_buttons(False)
         header.set_show_end_title_buttons(False)
+
+        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        self.close_button.set_tooltip_text(parent._("Close"))
+        self.close_button.connect("clicked", lambda _button: self.close())
+        header.pack_end(self.close_button)
 
         self.delete_button = Gtk.Button.new_from_icon_name("user-trash-symbolic")
         self.delete_button.set_tooltip_text(parent._("Delete"))
@@ -104,11 +156,6 @@ class ViewerWindow(Adw.ApplicationWindow):
         self.fullscreen_btn.connect("clicked", self._toggle_fullscreen)
         self.fullscreen_btn.set_visible(False)
         header.pack_end(self.fullscreen_btn)
-
-        self.close_button = Gtk.Button.new_from_icon_name("window-close-symbolic")
-        self.close_button.set_tooltip_text(parent._("Close"))
-        self.close_button.connect("clicked", lambda _button: self.close())
-        header.pack_end(self.close_button)
 
         self._editor: EditorView | None = None
         self.toolbar.add_top_bar(header)
@@ -233,7 +280,6 @@ class ViewerWindow(Adw.ApplicationWindow):
             return
         if item.is_video:
             self._current_is_video = True
-            self.delete_button.set_visible(True)
             self.info_button.set_visible(True)
             self.fullscreen_btn.set_visible(True)
             video = Gtk.Video.new_for_file(Gio.File.new_for_path(local_path))
@@ -636,7 +682,7 @@ class ViewerWindow(Adw.ApplicationWindow):
                 Path(item.thumb_path).unlink(missing_ok=True)
             except OSError:
                 pass
-        self.parent_window.database.delete_path(item.path)
+        self.parent_window.database.delete_path(item.path, item.category)
         self.items.pop(self.index)
         self.parent_window.refresh(scan=False)
         if not self.items:
@@ -659,6 +705,10 @@ class ViewerWindow(Adw.ApplicationWindow):
             dims = _image_dimensions(item.path)
             if dims:
                 rows.append((_("Dimensions"), dims))
+            exif = _extract_exif(item.path)
+            for key in ("Camera", "GPS"):
+                if key in exif:
+                    rows.append((_(key), exif[key]))
 
         grid = Gtk.Grid()
         grid.set_column_spacing(20)
@@ -671,7 +721,8 @@ class ViewerWindow(Adw.ApplicationWindow):
             key_lbl = Gtk.Label(label=key, xalign=1.0)
             key_lbl.add_css_class("dim-label")
             val_lbl = Gtk.Label(label=value, xalign=0.0)
-            val_lbl.set_selectable(True)
+            is_name = (i == 0)
+            val_lbl.set_selectable(not is_name)
             val_lbl.set_wrap(True)
             val_lbl.set_max_width_chars(32)
             grid.attach(key_lbl, 0, i, 1, 1)
