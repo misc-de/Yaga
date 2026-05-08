@@ -644,7 +644,13 @@ class ViewerWindow(Adw.ApplicationWindow):
             self._editor = EditorView(edit_item, self.parent_window._)
         except Exception as exc:
             LOGGER.exception("Could not open editor: %s", exc)
-            self.parent_window._set_status(self.parent_window._("Could not open editor"))
+            # Show informative error dialog
+            dialog = Adw.AlertDialog(
+                heading=self.parent_window._("Could not open editor"),
+                body=self.parent_window._("The image editor could not start. This may be due to insufficient memory or unsupported image format."),
+            )
+            dialog.add_response("close", self.parent_window._("Close"))
+            dialog.present(self.get_root())
             self._set_view_gestures_enabled(True)
             self.show_item()
             return
@@ -681,7 +687,8 @@ class ViewerWindow(Adw.ApplicationWindow):
                 self._upload_to_nextcloud(local_path)
             
             GLib.idle_add(self._save_edit_done, True)
-        except Exception:
+        except Exception as exc:
+            LOGGER.exception("Could not save edited image: %s", exc)
             GLib.idle_add(self._save_edit_done, False)
 
     def _save_edit_done(self, success: bool) -> None:

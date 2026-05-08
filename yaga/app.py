@@ -146,6 +146,70 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.status.set_text(text)
         self.status.set_visible(bool(text))
 
+    def _show_error_dialog(self, title: str, message: str, details: str = "") -> None:
+        """Show an error dialog with title, message, and optional details."""
+        dialog = Adw.AlertDialog(heading=title, body=message)
+        dialog.add_response("close", self._("Close"))
+        dialog.set_default_response("close")
+        if details:
+            dialog.set_body(f"{message}\n\n{details}")
+        dialog.present(self)
+
+    def _handle_file_error(self, error: Exception, file_path: str = "") -> None:
+        """Handle file-related errors with specific messages."""
+        if isinstance(error, FileNotFoundError):
+            self._show_error_dialog(
+                self._("File not found"),
+                self._("Could not access the file. It may have been moved, deleted, or you don't have permission."),
+                f"Path: {file_path}" if file_path else ""
+            )
+        elif isinstance(error, PermissionError):
+            self._show_error_dialog(
+                self._("Permission denied"),
+                self._("You don't have permission to access this file."),
+                f"Path: {file_path}" if file_path else ""
+            )
+        elif isinstance(error, OSError) as ose:
+            details = str(ose) if str(ose) else ""
+            self._show_error_dialog(
+                self._("System error"),
+                self._("Could not access the file due to a system error."),
+                details
+            )
+        else:
+            self._show_error_dialog(
+                self._("Error"),
+                self._("An unexpected error occurred."),
+                str(error)
+            )
+
+    def _handle_nextcloud_error(self, error: Exception) -> None:
+        """Handle Nextcloud-specific errors with recovery suggestions."""
+        if isinstance(error, PermissionError):
+            self._show_error_dialog(
+                self._("Nextcloud authentication failed"),
+                self._("The app password is incorrect or the account has been revoked. Check Nextcloud settings."),
+                str(error)
+            )
+        elif isinstance(error, FileNotFoundError):
+            self._show_error_dialog(
+                self._("Nextcloud path not found"),
+                self._("The folder or file doesn't exist on the Nextcloud server. It may have been deleted."),
+                str(error)
+            )
+        elif isinstance(error, ConnectionError):
+            self._show_error_dialog(
+                self._("Connection failed"),
+                self._("Could not connect to Nextcloud. Check your internet connection and server URL."),
+                ""
+            )
+        else:
+            self._show_error_dialog(
+                self._("Nextcloud error"),
+                self._("An error occurred while accessing Nextcloud."),
+                str(error)
+            )
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -735,14 +799,26 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _on_sel_delete_confirmed(self, _dialog, response: str, paths: list[str]) -> None:
         if response != "delete":
             return
+        errors: list[tuple[str, Exception]] = []
         for path in paths:
             try:
                 Gio.File.new_for_path(path).trash(None)
                 self.database.delete_path(path, self.category)
-            except GLib.Error:
-                pass
+            except GLib.Error as e:
+                errors.append((path, e))
+            except Exception as e:
+                errors.append((path, e))
         self._exit_selection_mode()
-        self._set_status(self._("Deleted"))
+        if not errors:
+            self._set_status(self._(f"Deleted {len(paths)} items"))
+        elif len(errors) == len(paths):
+            self._show_error_dialog(
+                self._("Delete failed"),
+                self._("Could not delete all files. Check file permissions or disk state."),
+                f"{len(errors)}/{len(paths)} items"
+            )
+        else:
+            self._set_status(self._(f"Deleted {len(paths) - len(errors)}/{len(paths)} items ({len(errors)} failed)"))
 
     def _sel_move_selected(self) -> None:
         if not self._selected_paths:
@@ -757,23 +833,48 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _on_sel_move_response(self, chooser: Gtk.FileChooserNative, response: int) -> None:
         if response == Gtk.ResponseType.ACCEPT:
             folder = chooser.get_file().get_path()
-            errors = 0
+            errors: list[tuple[str, Exception]] = []
             for path in list(self._selected_paths):
                 try:
                     target = Path(folder) / Path(path).name
                     Path(path).rename(target)
                     self.database.delete_path(path, self.category)
-                except OSError:
-                    errors += 1
+                except (OSError, PermissionError) as e:
+                    errors.append((path, e))
             self._exit_selection_mode()
             self.refresh(scan=True)
-            self._set_status(self._("Moved") if not errors else self._("Could not complete action"))
+            if not errors:
+                self._set_status(self._(f"Moved {len(self._selected_paths)} items"))
+            elif len(errors) == len(self._selected_paths):
+                self._show_error_dialog(
+                    self._("Move failed"),
+                    self._("Could not move files. Check file permissions and disk space."),
+                    f"{len(errors)} file(s) failed"
+                )
+            else:
+                self._set_status(self._(f"Moved {len(self._selected_paths) - len(errors)} items ({len(errors)} failed)"))
         chooser.destroy()
 
-    def _delete_item(self, item: MediaItem) -> None:
+    def _del_item(self, item: MediaItem) -> None:
         try:
             Gio.File.new_for_path(item.path).trash(None)
             self.database.delete_path(item.path, item.category)
+            self._set_status(self._("Deleted"))
+        except GLib.Error as e:
+            if "Permission" in str(e):
+                self._show_error_dialog(
+                    self._("Cannot delete"),
+                    self._("Permission denied. The file or folder is protected."),
+                    ""
+                )
+            else:
+                self._show_error_dialog(
+                    self._("Delete failed"),
+                    self._("Could not move the file to trash."),
+                    str(e)
+                )
+        except Exception as e:
+            self._handle_file_error(e, item.path)
             self._render()
             self._set_status(self._("Deleted"))
         except GLib.Error:
