@@ -120,6 +120,12 @@ class GalleryWindow(Adw.ApplicationWindow):
         self._nc_folder_sync_generation = 0
         self._date_group_modes: dict[str, str] = {}
 
+        # Pagination for large galleries
+        self._page_size: int = 100  # Load 100 items per page
+        self._current_offset: int = 0
+        self._total_count: int = 0
+        self._has_more_items: bool = False
+
         # Track last-rendered view so we can preserve scroll position on refresh
         self._last_render_key: tuple[str, str | None] | None = None
 
@@ -438,6 +444,7 @@ class GalleryWindow(Adw.ApplicationWindow):
 
         self.gallery_grid.clear()
         self.current_items = []
+        self._current_offset = 0
 
         sort_mode = self.settings.get_sort_mode(self.category, self.current_folder)
         self.back_button.set_visible(False)
@@ -446,9 +453,23 @@ class GalleryWindow(Adw.ApplicationWindow):
         elif sort_mode == "date":
             self._render_date_groups()
         else:
-            self.current_items = self.database.list_media(
-                self.category, sort_mode, self.current_folder
-            )
+            # For large galleries, use pagination to reduce memory and improve responsiveness
+            self._total_count = self.database.count_media(self.category, self.current_folder)
+            
+            # If gallery has > 300 items, load only first page; otherwise load all
+            if self._total_count > 300:
+                self.current_items = self.database.list_media_paginated(
+                    self.category, sort_mode, self.current_folder, self._page_size, 0
+                )
+                self._current_offset = self._page_size
+                self._has_more_items = self._total_count > self._page_size
+                LOGGER.debug("Loaded first page (%d items) of %d total", len(self.current_items), self._total_count)
+            else:
+                self.current_items = self.database.list_media(
+                    self.category, sort_mode, self.current_folder
+                )
+                self._has_more_items = False
+            
             for item in self.current_items:
                 self.gallery_grid.append_media(item, item.path in self._selected_paths)
             self._set_status("")
@@ -460,6 +481,10 @@ class GalleryWindow(Adw.ApplicationWindow):
                 vadj.set_value(saved_pos)
                 return GLib.SOURCE_REMOVE
             GLib.idle_add(_restore, priority=GLib.PRIORITY_HIGH_IDLE)
+        
+        # Setup lazy-loading for paginated galleries
+        if self._has_more_items:
+            self._setup_lazy_loading()
 
     def _render_folders(self) -> None:
         sort_mode = self.settings.get_sort_mode(self.category, self.current_folder)
@@ -516,6 +541,48 @@ class GalleryWindow(Adw.ApplicationWindow):
         if not remainder or "/" not in remainder and item_folder == parent:
             return None
         return f"{parent}/{remainder.split('/', 1)[0]}"
+
+    def _setup_lazy_loading(self) -> None:
+        """Setup scroll listener for lazy-loading additional pages."""
+        vadj = self.gallery_grid.get_vadjustment()
+        vadj.connect("notify::value", self._on_scroll)
+
+    def _on_scroll(self, vadj: Gtk.Adjustment, _param) -> None:
+        """Check if user scrolled near bottom, load more items if needed."""
+        if not self._has_more_items:
+            return
+        
+        # Load more when user is 80% down the list
+        upper = vadj.get_upper()
+        page_size = vadj.get_page_size()
+        current = vadj.get_value()
+        
+        if upper > 0 and current + page_size >= upper * 0.8:
+            self._load_more_items()
+
+    def _load_more_items(self) -> None:
+        """Load next page of items and append to gallery."""
+        if not self._has_more_items or self._current_offset >= self._total_count:
+            self._has_more_items = False
+            return
+        
+        sort_mode = self.settings.get_sort_mode(self.category, self.current_folder)
+        next_items = self.database.list_media_paginated(
+            self.category, sort_mode, self.current_folder, self._page_size, self._current_offset
+        )
+        
+        if not next_items:
+            self._has_more_items = False
+            return
+        
+        for item in next_items:
+            self.current_items.append(item)
+            self.gallery_grid.append_media(item, item.path in self._selected_paths)
+        
+        self._current_offset += self._page_size
+        self._has_more_items = self._current_offset < self._total_count
+        
+        LOGGER.debug("Lazy-loaded %d more items (total: %d)", len(next_items), len(self.current_items))
 
     # ------------------------------------------------------------------
     # Item actions
@@ -937,8 +1004,14 @@ class GalleryWindow(Adw.ApplicationWindow):
         columns = min(max(int(self.settings.grid_columns), 2), 10)
         # Each cell has 1px padding on each side → 2px per cell
         cell_size = max(32, scroller_width // columns)
+        # Set both min AND max height to keep tiles square and fixed size
         self._tile_css.load_from_data(
-            f".gallery-tile {{ min-height: {cell_size}px; }}".encode()
+            f""".gallery-tile {{
+                min-height: {cell_size}px;
+                max-height: {cell_size}px;
+                min-width: {cell_size}px;
+                max-width: {cell_size}px;
+            }}""".encode()
         )
 
     def _load_css(self) -> None:

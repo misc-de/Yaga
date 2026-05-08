@@ -260,8 +260,6 @@ class GalleryGrid(Gtk.Overlay):
     def _make_tile_button(self, tile_index: int, list_item: Gtk.ListItem) -> Gtk.Button:
         single_pic = Gtk.Picture()
         single_pic.set_content_fit(Gtk.ContentFit.COVER)
-        single_pic.set_hexpand(True)
-        single_pic.set_vexpand(True)
 
         pic_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         pic_row1.set_vexpand(True)
@@ -302,8 +300,6 @@ class GalleryGrid(Gtk.Overlay):
         check.set_visible(False)
 
         overlay = Gtk.Overlay()
-        overlay.set_hexpand(True)
-        overlay.set_vexpand(True)
         overlay.set_child(single_pic)
         overlay.add_overlay(pic_grid)
         overlay.add_overlay(badge)
@@ -313,8 +309,6 @@ class GalleryGrid(Gtk.Overlay):
         button = Gtk.Button()
         button.add_css_class("flat")
         button.add_css_class("gallery-tile")
-        button.set_hexpand(True)
-        button.set_vexpand(True)
         button.set_child(overlay)
 
         button._single_pic = single_pic        # type: ignore[attr-defined]

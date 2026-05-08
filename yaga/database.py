@@ -186,6 +186,39 @@ class Database:
             rows = self.conn.execute(f"SELECT * FROM media WHERE {where} ORDER BY {order}", args).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def count_media(self, category: str, folder: str | None = None) -> int:
+        """Return total count of media items (for pagination)."""
+        args: list[str] = [category]
+        where = "category = ?"
+        if folder:
+            where += " AND folder = ?"
+            args.append(folder)
+        with self.lock:
+            result = self.conn.execute(f"SELECT COUNT(*) FROM media WHERE {where}", args).fetchone()
+        return result[0] if result else 0
+
+    def list_media_paginated(
+        self, category: str, sort_mode: str = "newest", folder: str | None = None, limit: int = 100, offset: int = 0
+    ) -> list[MediaItem]:
+        """Return paginated media items with LIMIT and OFFSET."""
+        order = {
+            "newest": "mtime DESC, name COLLATE NOCASE ASC",
+            "oldest": "mtime ASC, name COLLATE NOCASE ASC",
+            "name": "name COLLATE NOCASE ASC",
+            "folder": "folder COLLATE NOCASE ASC, mtime DESC",
+        }.get(sort_mode, "mtime DESC")
+        args: list[str] = [category]
+        where = "category = ?"
+        if folder:
+            where += " AND folder = ?"
+            args.append(folder)
+        args.extend([limit, offset])
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM media WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?", args
+            ).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
     def get_media_by_path(self, path: str, category: str | None = None) -> MediaItem | None:
         with self.lock:
             if category is not None:
