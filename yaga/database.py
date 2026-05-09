@@ -57,6 +57,45 @@ ALTER TABLE media ADD COLUMN exif_data TEXT DEFAULT NULL;
 PRAGMA user_version = 2;
 """
 
+# Face-recognition tables. Kept in their own migration so that re-indexing
+# (e.g. after a model upgrade) never has to touch the media table.
+_MIGRATION_V3 = """
+CREATE TABLE IF NOT EXISTS persons (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    cover_face_id INTEGER,
+    created_at REAL NOT NULL,
+    hidden INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS faces (
+    id INTEGER PRIMARY KEY,
+    media_path TEXT NOT NULL,
+    media_category TEXT NOT NULL,
+    bbox TEXT NOT NULL,
+    landmarks TEXT,
+    embedding BLOB NOT NULL,
+    quality REAL NOT NULL,
+    thumb_path TEXT,
+    person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+    cluster_id INTEGER,
+    detected_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_faces_media ON faces(media_path, media_category);
+CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
+CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
+
+CREATE TABLE IF NOT EXISTS face_index_state (
+    media_path TEXT NOT NULL,
+    media_category TEXT NOT NULL,
+    media_mtime REAL NOT NULL,
+    detected_version INTEGER NOT NULL,
+    PRIMARY KEY (media_path, media_category)
+);
+
+PRAGMA user_version = 3;
+"""
+
 
 class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
@@ -93,6 +132,9 @@ class Database:
             except sqlite3.OperationalError:
                 # Column already exists
                 pass
+        if version < 3:
+            self.conn.executescript(_MIGRATION_V3)
+            self.conn.commit()
 
     def upsert_media(self, *, path: Path, category: str, media_type: str, folder: str, thumb_path: str | None) -> None:
         stat = path.stat()

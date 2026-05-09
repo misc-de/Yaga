@@ -323,6 +323,11 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.sort_button.set_popover(self._sort_popover)
         self.header.pack_end(self.sort_button)
 
+        self.people_button = Gtk.Button.new_from_icon_name("avatar-default-symbolic")
+        self.people_button.set_tooltip_text(self._("People"))
+        self.people_button.connect("clicked", self._open_people)
+        self.header.pack_end(self.people_button)
+
         # ── Selection-mode header widgets (hidden until long-press activates) ──
         self._sel_cancel_btn = Gtk.Button.new_from_icon_name("window-close-symbolic")
         self._sel_cancel_btn.set_tooltip_text(self._("Cancel selection"))
@@ -1665,6 +1670,29 @@ class GalleryWindow(Adw.ApplicationWindow):
 
     def _open_settings(self, _button: Gtk.Button) -> None:
         SettingsWindow(self).present()
+
+    def _open_people(self, _button: Gtk.Button) -> None:
+        """Open the People view. Stub for now — shows install hint when the
+        optional ML stack isn't present, otherwise opens a placeholder dialog
+        until the people page is wired up."""
+        from . import faces
+        if not faces.is_available():
+            caps = faces.capabilities()
+            missing = [name for name, ok in caps.items() if not ok]
+            self._show_error_dialog(
+                self._("People"),
+                self._("Face recognition needs additional packages."),
+                self._("Install with: pip install 'yaga-gallery[faces]'") +
+                "\n\n" + self._("Missing: ") + ", ".join(missing),
+            )
+            return
+        dialog = Adw.AlertDialog(
+            heading=self._("People"),
+            body=self._("The people view is being built — face indexing is ready, UI is next."),
+        )
+        dialog.add_response("close", self._("Close"))
+        dialog.set_default_response("close")
+        dialog.present(self)
 
     def _show_privacy_info(self, _button: Gtk.Button) -> None:
         """Show privacy and help information dialog."""
