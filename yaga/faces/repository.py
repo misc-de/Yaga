@@ -159,6 +159,65 @@ class FaceRepository:
             for r in rows
         ]
 
+    def list_unnamed_clusters(self) -> list[dict]:
+        """Auto-discovered clusters that haven't been promoted to a person yet.
+        Each item: cluster_id, count, cover_thumb (highest-quality face)."""
+        with self.database.lock:
+            rows = self.database.conn.execute(
+                """
+                SELECT f1.cluster_id AS cluster_id,
+                       COUNT(*) AS cnt,
+                       (SELECT thumb_path FROM faces f2
+                        WHERE f2.cluster_id = f1.cluster_id
+                          AND f2.person_id IS NULL
+                          AND f2.thumb_path IS NOT NULL
+                        ORDER BY f2.quality DESC LIMIT 1) AS cover
+                FROM faces f1
+                WHERE f1.cluster_id IS NOT NULL AND f1.person_id IS NULL
+                GROUP BY f1.cluster_id
+                ORDER BY cnt DESC
+                """
+            ).fetchall()
+        return [
+            {"cluster_id": r["cluster_id"], "count": r["cnt"], "cover_thumb": r["cover"]}
+            for r in rows
+        ]
+
+    def cover_thumb_for_person(self, person_id: int) -> str | None:
+        """Resolve persons.cover_face_id; if unset, fall back to the highest-
+        quality face attached to that person."""
+        with self.database.lock:
+            row = self.database.conn.execute(
+                """
+                SELECT COALESCE(
+                    (SELECT thumb_path FROM faces
+                     WHERE id = (SELECT cover_face_id FROM persons WHERE id = ?)),
+                    (SELECT thumb_path FROM faces
+                     WHERE person_id = ? AND thumb_path IS NOT NULL
+                     ORDER BY quality DESC LIMIT 1)
+                ) AS thumb
+                """,
+                (person_id, person_id),
+            ).fetchone()
+        return row["thumb"] if row and row["thumb"] else None
+
+    def rename_person(self, person_id: int, name: str) -> None:
+        with self.database.lock:
+            self.database.conn.execute(
+                "UPDATE persons SET name = ? WHERE id = ?", (name, person_id),
+            )
+
+    def delete_person(self, person_id: int) -> None:
+        """Drop the person and detach all their faces back into the unnamed
+        pool. We clear person_id explicitly because PRAGMA foreign_keys is
+        not enabled on this connection, so the schema's ON DELETE SET NULL
+        wouldn't fire on its own."""
+        with self.database.lock:
+            self.database.conn.execute(
+                "UPDATE faces SET person_id = NULL WHERE person_id = ?", (person_id,),
+            )
+            self.database.conn.execute("DELETE FROM persons WHERE id = ?", (person_id,))
+
     def media_paths_for_person(self, person_id: int) -> list[tuple[str, str]]:
         with self.database.lock:
             rows = self.database.conn.execute(

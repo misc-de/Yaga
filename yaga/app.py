@@ -1672,27 +1672,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         SettingsWindow(self).present()
 
     def _open_people(self, _button: Gtk.Button) -> None:
-        """Open the People view. Stub for now — shows install hint when the
-        optional ML stack isn't present, otherwise opens a placeholder dialog
-        until the people page is wired up."""
-        from . import faces
-        if not faces.is_available():
-            caps = faces.capabilities()
-            missing = [name for name, ok in caps.items() if not ok]
-            self._show_error_dialog(
-                self._("People"),
-                self._("Face recognition needs additional packages."),
-                self._("Install with: pip install 'yaga-gallery[faces]'") +
-                "\n\n" + self._("Missing: ") + ", ".join(missing),
-            )
-            return
-        dialog = Adw.AlertDialog(
-            heading=self._("People"),
-            body=self._("The people view is being built — face indexing is ready, UI is next."),
-        )
-        dialog.add_response("close", self._("Close"))
-        dialog.set_default_response("close")
-        dialog.present(self)
+        from .people_window import PeopleWindow
+        PeopleWindow(self).present()
 
     def _show_privacy_info(self, _button: Gtk.Button) -> None:
         """Show privacy and help information dialog."""
