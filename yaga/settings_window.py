@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -11,6 +12,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 from .config import Settings
+
+LOGGER = logging.getLogger(__name__)
 
 class SettingsWindow(Adw.PreferencesWindow):
     def __init__(self, parent: GalleryWindow) -> None:
@@ -109,7 +112,136 @@ class SettingsWindow(Adw.PreferencesWindow):
         cache_group.add(self._cache_size_row)
         self._refresh_cache_size_display()
 
+        self._build_people_page()
         self._build_nextcloud_page()
+
+    def _build_people_page(self) -> None:
+        page = Adw.PreferencesPage(
+            title=self._("People"), icon_name="avatar-default-symbolic",
+        )
+        self.add(page)
+
+        from . import faces as faces_module
+
+        caps = faces_module.capabilities()
+        available = faces_module.is_available()
+
+        # ── Toggle group ──────────────────────────────────────────────────
+        if available:
+            description = self._("Detection runs entirely on your device.")
+        else:
+            missing = ", ".join(name for name, ok in caps.items() if not ok)
+            description = (
+                self._("Install with: pip install 'yaga-gallery[faces]'")
+                + "\n"
+                + self._("Missing: ") + missing
+            )
+
+        toggle_group = Adw.PreferencesGroup(
+            title=self._("Face recognition"),
+            description=description,
+        )
+        page.add(toggle_group)
+
+        self._face_enabled_row = Adw.SwitchRow(
+            title=self._("Enable face recognition"),
+            subtitle=self._("Index faces during media scans and group them into people"),
+        )
+        self._face_enabled_row.set_active(
+            self.settings.face_recognition_enabled and available
+        )
+        self._face_enabled_row.set_sensitive(available)
+        self._face_enabled_row.connect("notify::active", self._face_enabled_changed)
+        toggle_group.add(self._face_enabled_row)
+
+        # ── Index management group ────────────────────────────────────────
+        manage_group = Adw.PreferencesGroup(title=self._("Index"))
+        page.add(manage_group)
+
+        self._face_stats_row = Adw.ActionRow(title=self._("Indexed faces"))
+        self._face_stats_row.set_subtitle("…")
+        manage_group.add(self._face_stats_row)
+
+        clear_row = Adw.ActionRow(
+            title=self._("Clear face index"),
+            subtitle=self._("Removes all detected faces, named people and indexing state"),
+        )
+        clear_btn = Gtk.Button(label=self._("Clear"))
+        clear_btn.add_css_class("destructive-action")
+        clear_btn.set_valign(Gtk.Align.CENTER)
+        clear_btn.connect("clicked", self._on_clear_face_index_clicked)
+        clear_row.add_suffix(clear_btn)
+        manage_group.add(clear_row)
+
+        self._refresh_face_stats()
+
+    def _face_enabled_changed(self, row: Adw.SwitchRow, _param) -> None:
+        value = row.get_active()
+        self.settings.face_recognition_enabled = value
+        self.parent_window.settings.face_recognition_enabled = value
+        self.parent_window.settings.save()
+
+    def _refresh_face_stats(self) -> None:
+        """Off-thread fetch of face/person counts, then update the row."""
+        def _worker():
+            try:
+                db = self.parent_window.database
+                with db.lock:
+                    n_faces = db.conn.execute("SELECT COUNT(*) FROM faces").fetchone()[0]
+                    n_persons = db.conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+            except Exception:
+                n_faces, n_persons = 0, 0
+            GLib.idle_add(self._set_face_stats_text, n_faces, n_persons)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _set_face_stats_text(self, n_faces: int, n_persons: int) -> bool:
+        self._face_stats_row.set_subtitle(
+            self._("{faces} faces, {people} people").format(
+                faces=n_faces, people=n_persons,
+            )
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _on_clear_face_index_clicked(self, _btn: Gtk.Button) -> None:
+        dialog = Adw.AlertDialog(
+            heading=self._("Clear face index?"),
+            body=self._("All detected faces and named people will be removed. Photos themselves are not touched."),
+        )
+        dialog.add_response("cancel", self._("Cancel"))
+        dialog.add_response("clear", self._("Clear"))
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def _resp(_d, response):
+            if response != "clear":
+                return
+            self._do_clear_face_index()
+        dialog.connect("response", _resp)
+        dialog.present(self)
+
+    def _do_clear_face_index(self) -> None:
+        def _worker():
+            try:
+                db = self.parent_window.database
+                # Capture face-thumb paths before wiping so we can remove the files.
+                with db.lock:
+                    thumbs = [r[0] for r in db.conn.execute(
+                        "SELECT thumb_path FROM faces WHERE thumb_path IS NOT NULL"
+                    ).fetchall()]
+                    db.conn.execute("DELETE FROM faces")
+                    db.conn.execute("DELETE FROM persons")
+                    db.conn.execute("DELETE FROM face_index_state")
+                    db.conn.commit()
+                for t in thumbs:
+                    try:
+                        Path(t).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            except Exception:
+                LOGGER.exception("Clear face index failed")
+            GLib.idle_add(self._refresh_face_stats)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _build_nextcloud_page(self) -> None:
         page = Adw.PreferencesPage(title="Nextcloud", icon_name="folder-remote-symbolic")

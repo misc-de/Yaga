@@ -116,6 +116,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.scanner = MediaScanner(self.database, self.thumbnailer)
         self.category = self._first_existing_category()
         self.current_folder: str | None = None
+        self.person_filter_id: int | None = None
+        self.person_filter_name: str = ""
         self.current_items: list[MediaItem] = []
         self.category_buttons: dict[str, Gtk.ToggleButton] = {}
         self._selection_mode: bool = False
@@ -206,7 +208,9 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _set_empty_state(self, visible: bool) -> None:
         """Pick an appropriate empty-state label for the current view."""
         missing = self.scanner.missing_root.get(self.category)
-        if visible and missing is not None:
+        if visible and self.person_filter_id is not None:
+            text = self.person_filter_name or self._("Person")
+        elif visible and missing is not None:
             display = self.current_folder or Path(missing).name or missing
             text = self._("Folder %s not found") % display
         else:
@@ -303,8 +307,16 @@ class GalleryWindow(Adw.ApplicationWindow):
         self.new_folder_button.connect("clicked", lambda _b: self._prompt_new_folder())
         self.header.pack_start(self.new_folder_button)
 
-        title = Adw.WindowTitle(title=APP_NAME, subtitle="")
-        self.header.set_title_widget(title)
+        self._title_widget = Adw.WindowTitle(title=APP_NAME, subtitle="")
+        self.header.set_title_widget(self._title_widget)
+
+        # Person-filter chip — only visible while filtering by a person.
+        self._clear_person_filter_btn = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        self._clear_person_filter_btn.set_tooltip_text(self._("Clear person filter"))
+        self._clear_person_filter_btn.add_css_class("flat")
+        self._clear_person_filter_btn.set_visible(False)
+        self._clear_person_filter_btn.connect("clicked", lambda _b: self._clear_person_filter())
+        self.header.pack_start(self._clear_person_filter_btn)
 
         self.refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         self.refresh_button.set_tooltip_text(self._("Refresh"))
@@ -692,6 +704,12 @@ class GalleryWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self.refresh, False)  # show folder structure immediately
                 # No bulk thumbnail pre-fetch: tiles request their own thumbnail when
                 # they scroll into view, which keeps the UI responsive on large folders.
+
+            # Phase 3: Face recognition (opt-in via Settings → People).
+            # Idempotent: face_index_state means subsequent passes only touch
+            # newly added or changed media items.
+            if self.settings.face_recognition_enabled:
+                self._run_face_indexing()
         except Exception as e:
             LOGGER.exception("Media scan failed: %s", e)
             GLib.idle_add(self._set_nc_broken, True)
@@ -784,7 +802,11 @@ class GalleryWindow(Adw.ApplicationWindow):
         if hasattr(self, "_sort_dropdown"):
             self._sync_sort_controls()
         self.back_button.set_visible(False)
-        if self._search_query:
+        if self.person_filter_id is not None:
+            # Person filter trumps every other view mode — flat grid of all
+            # photos containing that person, sorted by the active sort.
+            self._render_person(sort_mode)
+        elif self._search_query:
             self._render_search(sort_mode)
         elif sort_mode in ("folder", "folder_desc"):
             self._render_folders()
@@ -892,6 +914,27 @@ class GalleryWindow(Adw.ApplicationWindow):
             self.search_entry.set_text("")
         if had_query:
             self._render()
+
+    def _render_person(self, sort_mode: str) -> None:
+        """Flat grid of photos containing the active person filter. Folder/
+        date/search overrides don't apply — the person view crosses categories."""
+        if sort_mode in ("folder", "folder_desc", "date", "date_asc"):
+            # These sorts are tied to the standard category view; the person
+            # filter ignores them and falls back to mtime DESC.
+            sort_mode = "newest"
+        person_id = self.person_filter_id
+        assert person_id is not None
+        self._total_count = self.database.count_media_for_person(person_id)
+        page = self.database.list_media_for_person(
+            person_id, sort_mode, limit=self._page_size, offset=0,
+        )
+        self.current_items = list(page)
+        self._current_offset = len(page)
+        self._has_more_items = self._current_offset < self._total_count
+        for item in page:
+            self.gallery_grid.append_media(item, item.path in self._selected_paths)
+        self._set_status("")
+        self._set_empty_state(visible=not self.current_items)
 
     def _render_flat(self, sort_mode: str) -> None:
         include_nc = self._should_merge_nc()
@@ -1460,8 +1503,8 @@ class GalleryWindow(Adw.ApplicationWindow):
         self._sel_delete_btn.set_visible(False)
         self._sel_move_btn.set_visible(False)
         # Restore normal header
-        title = Adw.WindowTitle(title=APP_NAME, subtitle="")
-        self.header.set_title_widget(title)
+        self.header.set_title_widget(self._title_widget)
+        self._update_title_for_filter()
         self.back_button.set_visible(False)
         self.new_folder_button.set_visible(True)
         self.search_button.set_visible(True)
@@ -1634,15 +1677,24 @@ class GalleryWindow(Adw.ApplicationWindow):
 
     def _on_category_toggled(self, button: Gtk.ToggleButton, category: str) -> None:
         if not button.get_active():
-            if category == self.category and self.current_folder is not None:
+            if category == self.category and (
+                self.current_folder is not None or self.person_filter_id is not None
+            ):
                 button.handler_block_by_func(self._on_category_toggled)
                 button.set_active(True)
                 button.handler_unblock_by_func(self._on_category_toggled)
                 self.current_folder = None
+                self.person_filter_id = None
+                self.person_filter_name = ""
+                self._update_title_for_filter()
                 self._render()
             return
         self.category = category
         self.current_folder = None
+        if self.person_filter_id is not None:
+            self.person_filter_id = None
+            self.person_filter_name = ""
+            self._update_title_for_filter()
         for other_category, other_button in self.category_buttons.items():
             if other_category != category:
                 other_button.set_active(False)
@@ -1651,6 +1703,9 @@ class GalleryWindow(Adw.ApplicationWindow):
         self._render()
 
     def _on_back(self, _button: Gtk.Button) -> None:
+        if self.person_filter_id is not None:
+            self._clear_person_filter()
+            return
         self._go_back_folder()
 
     def _go_back_folder(self) -> None:
@@ -1674,6 +1729,64 @@ class GalleryWindow(Adw.ApplicationWindow):
     def _open_people(self, _button: Gtk.Button) -> None:
         from .people_window import PeopleWindow
         PeopleWindow(self).present()
+
+    def _run_face_indexing(self) -> None:
+        """Phase-3 of the scan worker: detect + embed + cluster. No-op when
+        the optional ML stack isn't installed; logs and swallows failures so
+        the rest of the scan finalisation still runs."""
+        from . import faces as faces_module
+        if not faces_module.is_available():
+            LOGGER.info(
+                "Face recognition enabled but optional packages missing; skipping pass"
+            )
+            return
+        try:
+            from .faces.indexer import FaceIndexer
+            from .faces.clusterer import FaceClusterer
+            processed = FaceIndexer(self.database).index_pending()
+            # Only re-cluster when the pool of unassigned faces actually grew —
+            # otherwise the clusters are already up to date.
+            if processed > 0:
+                FaceClusterer(self.database).recluster()
+        except Exception:
+            LOGGER.exception("Face indexing pass failed")
+
+    def set_person_filter(self, person_id: int, name: str) -> None:
+        """Switch the gallery into person-filter mode. The category buttons,
+        folder navigation and search are bypassed while a person filter is
+        active — clearing it returns to the previous category view."""
+        self.person_filter_id = person_id
+        self.person_filter_name = name
+        # Person filter cuts across categories/folders, so any folder drill-down
+        # would be misleading.
+        self.current_folder = None
+        if self._search_query:
+            self._search_query = ""
+            self.search_entry.set_text("")
+            self.search_bar.set_search_mode(False)
+        self._update_title_for_filter()
+        self._render()
+
+    def _clear_person_filter(self) -> None:
+        if self.person_filter_id is None:
+            return
+        self.person_filter_id = None
+        self.person_filter_name = ""
+        self._update_title_for_filter()
+        self._render()
+
+    def _update_title_for_filter(self) -> None:
+        """Sync title + clear-button visibility to person_filter_id. The title
+        is just the person's name — the visible × button next to it carries
+        the filter-mode affordance, no redundant 'Photos of …' subtitle."""
+        if self.person_filter_id is not None:
+            self._title_widget.set_title(self.person_filter_name or self._("Person"))
+            self._title_widget.set_subtitle("")
+            self._clear_person_filter_btn.set_visible(True)
+        else:
+            self._title_widget.set_title(APP_NAME)
+            self._title_widget.set_subtitle("")
+            self._clear_person_filter_btn.set_visible(False)
 
     def _show_privacy_info(self, _button: Gtk.Button) -> None:
         """Show privacy and help information dialog."""

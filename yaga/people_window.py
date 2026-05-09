@@ -254,10 +254,7 @@ class PeopleWindow(Adw.ApplicationWindow):
     # ── Actions ────────────────────────────────────────────────────────────
 
     def _on_person_clicked(self, person) -> None:
-        # The gallery filter for "show only this person's media" lands in a
-        # follow-up commit. For now, just close — opening a person tile is
-        # already the discoverable hook.
-        LOGGER.debug("Person tile clicked: id=%s name=%s", person.id, person.name)
+        self.parent_window.set_person_filter(person.id, person.name)
         self.close()
 
     def _on_cluster_name(self, cluster: dict) -> None:

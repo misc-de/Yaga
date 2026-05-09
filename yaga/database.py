@@ -436,6 +436,44 @@ class Database:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def list_media_for_person(
+        self, person_id: int, sort_mode: str = "newest",
+        limit: int | None = None, offset: int = 0,
+    ) -> list[MediaItem]:
+        """Media items containing at least one face assigned to this person.
+        DISTINCT because a person can appear multiple times in the same photo."""
+        order = {
+            "newest":      "m.mtime DESC, m.name COLLATE NOCASE ASC",
+            "oldest":      "m.mtime ASC, m.name COLLATE NOCASE ASC",
+            "name":        "m.name COLLATE NOCASE ASC",
+            "name_desc":   "m.name COLLATE NOCASE DESC",
+            "folder":      "m.folder COLLATE NOCASE ASC, m.mtime DESC",
+            "folder_desc": "m.folder COLLATE NOCASE DESC, m.mtime DESC",
+        }.get(sort_mode, "m.mtime DESC")
+        sql = (
+            "SELECT DISTINCT m.* FROM media m "
+            "INNER JOIN faces f "
+            "  ON f.media_path = m.path AND f.media_category = m.category "
+            f"WHERE f.person_id = ? ORDER BY {order}"
+        )
+        args: list = [person_id]
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args.extend([int(limit), int(offset)])
+        with self.lock:
+            rows = self.conn.execute(sql, args).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def count_media_for_person(self, person_id: int) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(DISTINCT m.path || '\\x00' || m.category) FROM media m "
+                "INNER JOIN faces f ON f.media_path = m.path AND f.media_category = m.category "
+                "WHERE f.person_id = ?",
+                (person_id,),
+            ).fetchone()
+        return row[0] if row else 0
+
     def get_media_by_path(self, path: str, category: str | None = None) -> MediaItem | None:
         with self.lock:
             if category is not None:
