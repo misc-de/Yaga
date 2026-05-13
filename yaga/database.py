@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -7,6 +8,8 @@ from pathlib import Path
 
 from .config import DB_PATH
 from .models import MediaItem
+
+LOGGER = logging.getLogger(__name__)
 
 
 SCHEMA_V1 = """
@@ -26,6 +29,12 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
 CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
 CREATE INDEX IF NOT EXISTS idx_media_mtime ON media(mtime);
+CREATE INDEX IF NOT EXISTS idx_media_cat_type_folder_mtime_name
+    ON media(category, media_type, folder, mtime DESC, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_media_cat_type_mtime_name
+    ON media(category, media_type, mtime DESC, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_media_type_mtime_name
+    ON media(media_type, mtime DESC, name COLLATE NOCASE);
 """
 
 _MIGRATION_V1 = """
@@ -57,8 +66,8 @@ ALTER TABLE media ADD COLUMN exif_data TEXT DEFAULT NULL;
 PRAGMA user_version = 2;
 """
 
-# Face-recognition tables. Kept in their own migration so that re-indexing
-# (e.g. after a model upgrade) never has to touch the media table.
+# Face-recognition tables (v3). Kept in their own migration so that
+# re-indexing (e.g. after a model upgrade) never has to touch the media table.
 _MIGRATION_V3 = """
 CREATE TABLE IF NOT EXISTS persons (
     id INTEGER PRIMARY KEY,
@@ -96,23 +105,96 @@ CREATE TABLE IF NOT EXISTS face_index_state (
 PRAGMA user_version = 3;
 """
 
+# v4 introduces an FTS5 trigram index over `media.name`. Trigram preserves
+# the substring-match UX users expect ("ach" still finds "Bachstrasse"),
+# while turning a full-table LIKE scan into an index probe — the dominant
+# cost on libraries with >10k items, masked today by the search debounce.
+# Stored as an external-content shadow table; AFTER triggers keep it in
+# sync with media without code-side bookkeeping.
+_FTS_CREATE_SQL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5("
+    "name, content='media', content_rowid='id', tokenize='trigram')"
+)
+_FTS_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS media_ai AFTER INSERT ON media BEGIN
+    INSERT INTO media_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS media_ad AFTER DELETE ON media BEGIN
+    INSERT INTO media_fts(media_fts, rowid, name) VALUES('delete', old.id, old.name);
+END;
+CREATE TRIGGER IF NOT EXISTS media_au AFTER UPDATE ON media BEGIN
+    INSERT INTO media_fts(media_fts, rowid, name) VALUES('delete', old.id, old.name);
+    INSERT INTO media_fts(rowid, name) VALUES (new.id, new.name);
+END;
+"""
+
+_MIGRATION_V6 = """
+CREATE INDEX IF NOT EXISTS idx_media_cat_type_folder_mtime_name
+    ON media(category, media_type, folder, mtime DESC, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_media_cat_type_mtime_name
+    ON media(category, media_type, mtime DESC, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_media_type_mtime_name
+    ON media(media_type, mtime DESC, name COLLATE NOCASE);
+PRAGMA user_version = 6;
+"""
+
 
 class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.RLock()
         self._db_path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        # WAL lets the scanner thread write while the main thread reads without
-        # SQLite-level blocking; synchronous=NORMAL is the recommended pairing
-        # (durable on power loss, far cheaper fsyncs).
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA temp_store=MEMORY")
+        # Per-thread connection storage. Each thread that touches the DB gets
+        # its own sqlite3.Connection (and its own RLock) on first access.
+        # WAL mode lets concurrent connections read/write without Python-level
+        # serialization, which is what previously caused the main thread to
+        # stall during long scanner sync passes: a single shared connection
+        # plus a global RLock meant a slow batch write would freeze
+        # gallery rendering until the batch finished. busy_timeout handles
+        # the rare write-vs-write race at the SQLite layer with a short
+        # internal wait-and-retry instead of an exception.
+        self._tls = threading.local()
+        # Initialise the *current* thread's connection so the schema/migration
+        # work below runs on a fully-configured handle.
+        self._open_conn()
         with self.lock:
             self.conn.executescript(SCHEMA_V1)
             self._migrate()
+
+    def _open_conn(self) -> "sqlite3.Connection":
+        """Open a fresh sqlite3 connection for the calling thread, applying
+        the same PRAGMAs as the main connection. Called lazily from the
+        :pyattr:`conn` property the first time each thread touches the DB."""
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # WAL: readers + one writer in parallel, no SQLite-level blocking.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        # 5 s busy timeout so concurrent writers wait at the SQLite layer
+        # instead of raising OperationalError("database is locked").
+        conn.execute("PRAGMA busy_timeout=5000")
+        self._tls.conn = conn
+        return conn
+
+    @property
+    def conn(self) -> "sqlite3.Connection":
+        c = getattr(self._tls, "conn", None)
+        if c is None:
+            c = self._open_conn()
+        return c
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Per-thread reentrant lock. Threads acquire *their own* lock — never
+        each other's — so the historic ``with self.lock:`` guards still work
+        within a single call site (executemany + ON CONFLICT etc.) without
+        re-introducing cross-thread serialization that was the actual UI
+        block during a long-running Nextcloud sync."""
+        lk = getattr(self._tls, "lock", None)
+        if lk is None:
+            lk = threading.RLock()
+            self._tls.lock = lk
+        return lk
 
     def _migrate(self) -> None:
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
@@ -135,6 +217,52 @@ class Database:
         if version < 3:
             self.conn.executescript(_MIGRATION_V3)
             self.conn.commit()
+        # FTS5 trigram index for substring search on `name`. Behind a
+        # try/except because older SQLite builds (or builds compiled
+        # without FTS5/trigram) would otherwise refuse to open the DB.
+        # Search falls back to LIKE when the table isn't there.
+        self._has_fts = False
+        try:
+            self.conn.execute(_FTS_CREATE_SQL)
+            if version < 4:
+                # SQLite-recommended way to (re)populate an external-
+                # content FTS5 index from scratch. An equivalent
+                # `INSERT … SELECT … WHERE id NOT IN (SELECT rowid
+                # FROM media_fts)` looked clever but the subquery
+                # against the empty FTS5 table during the same
+                # statement actually corrupts the trigram index — MATCH
+                # silently returns nothing afterward, even though the
+                # rows are visible via `SELECT rowid, name FROM
+                # media_fts`. The 'rebuild' command is the documented
+                # initial-population path and idempotent on its own.
+                self.conn.execute("INSERT INTO media_fts(media_fts) VALUES('rebuild')")
+                self.conn.executescript(_FTS_TRIGGERS_SQL)
+                self.conn.execute("PRAGMA user_version = 4")
+                self.conn.commit()
+            self._has_fts = True
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning(
+                "FTS5 trigram index unavailable; search uses LIKE fallback: %s", exc,
+            )
+        if version < 5:
+            # Overview became a virtual aggregator: any rows previously
+            # indexed under category='pictures' are now duplicates of what
+            # other categories (photos/videos/screenshots/extras) provide.
+            # Drop them once so the aggregator query doesn't double-list
+            # files that happened to live under both ~/Pictures and
+            # another scanned root.
+            try:
+                self.conn.execute("DELETE FROM media WHERE category = 'pictures'")
+                self.conn.execute("PRAGMA user_version = 5")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        if version < 6:
+            try:
+                self.conn.executescript(_MIGRATION_V6)
+                self.conn.commit()
+            except sqlite3.OperationalError as exc:
+                LOGGER.warning("Could not create media performance indexes: %s", exc)
 
     def upsert_media(self, *, path: Path, category: str, media_type: str, folder: str, thumb_path: str | None) -> None:
         stat = path.stat()
@@ -266,17 +394,41 @@ class Database:
             self.conn.commit()
 
     @staticmethod
-    def _build_list_where(category: str, folder: str | None, include_nc: bool) -> tuple[str, list]:
+    def _build_list_where(category: str, folder: str | None, include_nc: bool,
+                          media_filter: str | None = None) -> tuple[str, list]:
         """Return (where_sql, args) for filtering by category (+ optional folder).
-        Image categories (pictures/photos/screenshots/nextcloud/...) restrict to
-        media_type='image'. The videos category aggregates videos across every
-        source. When include_nc is True for an image category, NC images are
-        merged in regardless of folder."""
+        Built-in image categories restrict to media_type='image'; the videos
+        and pictures (Overview) categories aggregate across every source.
+        *media_filter* overrides the per-category default for extras:
+        "both" drops the type constraint, "videos" flips to videos-only,
+        "images" keeps the image-only default."""
         if category == "videos":
             # Aggregate: every video on disk or NC, regardless of which root holds it.
             return "media_type = 'video'", []
+        if category == "pictures":
+            # Overview is a virtual aggregator across every local category.
+            # `category != 'pictures'` excludes any stale rows the migration
+            # missed; NC is folded in only when the caller explicitly opted
+            # into it via include_nc, matching the historic pictures view.
+            args_pic: list = []
+            base_pic = "category NOT IN ('pictures', 'nextcloud')"
+            if media_filter == "videos":
+                base_pic += " AND media_type = 'video'"
+            elif media_filter != "both":
+                base_pic += " AND media_type = 'image'"
+            if folder:
+                base_pic += " AND folder = ?"
+                args_pic.append(folder)
+            if include_nc:
+                return f"({base_pic}) OR (category = 'nextcloud' AND media_type = 'image')", args_pic
+            return base_pic, args_pic
         args: list = [category]
-        local = "category = ? AND media_type = 'image'"
+        if media_filter == "videos":
+            local = "category = ? AND media_type = 'video'"
+        elif media_filter == "both":
+            local = "category = ?"
+        else:
+            local = "category = ? AND media_type = 'image'"
         if folder:
             local += " AND folder = ?"
             args.append(folder)
@@ -286,7 +438,7 @@ class Database:
         return local, args
 
     def list_media(self, category: str, sort_mode: str = "newest", folder: str | None = None,
-                   include_nc: bool = False) -> list[MediaItem]:
+                   include_nc: bool = False, media_filter: str | None = None) -> list[MediaItem]:
         order = {
             "newest":      "mtime DESC, name COLLATE NOCASE ASC",
             "oldest":      "mtime ASC, name COLLATE NOCASE ASC",
@@ -295,14 +447,15 @@ class Database:
             "folder":      "folder COLLATE NOCASE ASC, mtime DESC",
             "folder_desc": "folder COLLATE NOCASE DESC, mtime DESC",
         }.get(sort_mode, "mtime DESC")
-        where, args = self._build_list_where(category, folder, include_nc)
+        where, args = self._build_list_where(category, folder, include_nc, media_filter)
         with self.lock:
             rows = self.conn.execute(f"SELECT * FROM media WHERE {where} ORDER BY {order}", args).fetchall()
         return [self._row_to_item(row) for row in rows]
 
-    def count_media(self, category: str, folder: str | None = None, include_nc: bool = False) -> int:
+    def count_media(self, category: str, folder: str | None = None, include_nc: bool = False,
+                    media_filter: str | None = None) -> int:
         """Return total count of media items (for pagination)."""
-        where, args = self._build_list_where(category, folder, include_nc)
+        where, args = self._build_list_where(category, folder, include_nc, media_filter)
         with self.lock:
             result = self.conn.execute(f"SELECT COUNT(*) FROM media WHERE {where}", args).fetchone()
         return result[0] if result else 0
@@ -324,8 +477,7 @@ class Database:
         "dezember": 12, "december": 12, "dec": 12, "dez": 12,
     }
 
-    @staticmethod
-    def _build_search_clause(query: str) -> tuple[str, list]:
+    def _build_search_clause(self, query: str) -> tuple[str, list]:
         """Build a SQL OR-clause that matches the query against name, exif
         text, year, year-month or month-name. Returns ('1=1', []) for an
         empty query so the caller can drop it back into a WHERE."""
@@ -337,9 +489,25 @@ class Database:
         clauses: list[str] = []
         args: list = []
         like = f"%{q}%"
-        # Filename
-        clauses.append("name LIKE ? COLLATE NOCASE")
-        args.append(like)
+        # Filename. With the FTS5 trigram index this is an index probe
+        # instead of a full-table LIKE scan; fall back to LIKE when the
+        # index isn't there or the query is too short for trigram (it
+        # tokenises as 3-grams and silently returns no rows for 1-2 char
+        # queries — substring LIKE preserves the user's mental model in
+        # those edge cases).
+        if getattr(self, "_has_fts", False) and len(q) >= 3:
+            # Wrap in double quotes so FTS5 special syntax (`OR`, `NEAR`,
+            # parentheses, …) inside a filename can't be reinterpreted as
+            # a query operator. Embedded double-quotes get the FTS5-spec
+            # `""` escape.
+            phrase = '"' + q.replace('"', '""') + '"'
+            clauses.append(
+                "id IN (SELECT rowid FROM media_fts WHERE media_fts MATCH ?)"
+            )
+            args.append(phrase)
+        else:
+            clauses.append("name LIKE ? COLLATE NOCASE")
+            args.append(like)
         # EXIF blob — LIKE on a JSON text column is a full-table scan; only
         # bother when the user has typed enough that a hit is realistic.
         if len(q) >= 3:
@@ -372,12 +540,12 @@ class Database:
 
     def search_media_count(
         self, category: str, query: str, folder: str | None = None,
-        include_nc: bool = False,
+        include_nc: bool = False, media_filter: str | None = None,
     ) -> int:
         """Total number of items matching the search query in the given
         category/folder context. Mirrors search_media so paginated callers
         can know when to stop fetching."""
-        base_where, args = self._build_list_where(category, folder, include_nc)
+        base_where, args = self._build_list_where(category, folder, include_nc, media_filter)
         search_where, search_args = self._build_search_clause(query)
         full_where = f"({base_where}) AND {search_where}"
         args.extend(search_args)
@@ -391,6 +559,7 @@ class Database:
         self, category: str, query: str, sort_mode: str = "newest",
         folder: str | None = None, include_nc: bool = False,
         limit: int | None = None, offset: int = 0,
+        media_filter: str | None = None,
     ) -> list[MediaItem]:
         """Filter media by a free-text query. Matches filename, EXIF text,
         year (4-digit), year-month (YYYY-MM / YYYY/MM / YYYY.MM) and locale
@@ -403,7 +572,7 @@ class Database:
             "folder":      "folder COLLATE NOCASE ASC, mtime DESC",
             "folder_desc": "folder COLLATE NOCASE DESC, mtime DESC",
         }.get(sort_mode, "mtime DESC")
-        base_where, args = self._build_list_where(category, folder, include_nc)
+        base_where, args = self._build_list_where(category, folder, include_nc, media_filter)
         search_where, search_args = self._build_search_clause(query)
         full_where = f"({base_where}) AND {search_where}"
         args.extend(search_args)
@@ -418,6 +587,7 @@ class Database:
     def list_media_paginated(
         self, category: str, sort_mode: str = "newest", folder: str | None = None,
         limit: int = 100, offset: int = 0, include_nc: bool = False,
+        media_filter: str | None = None,
     ) -> list[MediaItem]:
         """Return paginated media items with LIMIT and OFFSET."""
         order = {
@@ -428,7 +598,7 @@ class Database:
             "folder":      "folder COLLATE NOCASE ASC, mtime DESC",
             "folder_desc": "folder COLLATE NOCASE DESC, mtime DESC",
         }.get(sort_mode, "mtime DESC")
-        where, args = self._build_list_where(category, folder, include_nc)
+        where, args = self._build_list_where(category, folder, include_nc, media_filter)
         args.extend([limit, offset])
         with self.lock:
             rows = self.conn.execute(
@@ -498,10 +668,26 @@ class Database:
             ).fetchall()
         return [(row["folder"], row["count"], row["thumb"]) for row in rows]
 
-    def child_folders(self, category: str, parent: str | None) -> list[tuple[str, int, list]]:
+    def child_folders(self, category: str, parent: str | None,
+                      media_filter: str | None = None) -> list[tuple[str, int, list]]:
         if category == "videos":
             sql = "SELECT folder, thumb_path FROM media WHERE media_type = 'video' ORDER BY mtime DESC"
             params: tuple = ()
+        elif category == "pictures":
+            # Overview aggregator — union across every local category.
+            if media_filter == "videos":
+                sql = "SELECT folder, thumb_path FROM media WHERE category NOT IN ('pictures', 'nextcloud') AND media_type = 'video' ORDER BY mtime DESC"
+            elif media_filter == "both":
+                sql = "SELECT folder, thumb_path FROM media WHERE category NOT IN ('pictures', 'nextcloud') ORDER BY mtime DESC"
+            else:
+                sql = "SELECT folder, thumb_path FROM media WHERE category NOT IN ('pictures', 'nextcloud') AND media_type = 'image' ORDER BY mtime DESC"
+            params = ()
+        elif media_filter == "videos":
+            sql = "SELECT folder, thumb_path FROM media WHERE category = ? AND media_type = 'video' ORDER BY mtime DESC"
+            params = (category,)
+        elif media_filter == "both":
+            sql = "SELECT folder, thumb_path FROM media WHERE category = ? ORDER BY mtime DESC"
+            params = (category,)
         else:
             sql = "SELECT folder, thumb_path FROM media WHERE category = ? AND media_type = 'image' ORDER BY mtime DESC"
             params = (category,)
@@ -519,7 +705,11 @@ class Database:
                 remainder = folder[len(parent_prefix):]
             else:
                 continue
-            if not remainder or "/" not in remainder and folder == parent:
+            # Skip empty remainders (stray trailing slashes). The previous
+            # `"/" not in remainder and folder == parent` clause was dead
+            # after the startswith check — parent_prefix is parent + "/",
+            # so a remainder ever existing implies folder != parent.
+            if not remainder:
                 continue
             child_name = remainder.split("/", 1)[0]
             child_path = child_name if parent in (None, "/") else f"{parent}/{child_name}"

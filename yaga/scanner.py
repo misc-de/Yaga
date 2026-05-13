@@ -15,17 +15,17 @@ class MediaScanner:
     def __init__(self, database: Database, thumbnailer: Thumbnailer) -> None:
         self.database = database
         self.thumbnailer = thumbnailer
-        self._visited_inodes: set[tuple] = set()  # Track (device, inode) to prevent symlink loops
         # Categories whose root location is gone (missing on disk / 404 on server).
         # Maps category → human-readable folder name shown in the empty state.
         self.missing_root: dict[str, str] = {}
 
     def scan(self, categories: list[tuple[str, str, str]], nc_client=None,
-             nc_thumbnail_only: bool = True) -> None:
+             nc_thumbnail_only: bool = True,
+             excluded_subtrees: list[str] | None = None) -> None:
         started = time.time()
         scanned_categories: list[str] = []
-        self._visited_inodes.clear()  # Reset for fresh scan
-        
+        excluded_paths = [Path(p).expanduser() for p in (excluded_subtrees or [])]
+
         for category, _label, root_text in categories:
             if category == "nextcloud":
                 if nc_client is not None:
@@ -34,40 +34,54 @@ class MediaScanner:
                 continue
             root = Path(root_text).expanduser()
             if not root.exists():
-                # Mark the category as missing AND prune so the gallery doesn't keep
-                # showing stale entries for a folder the user has deleted. (If a user
-                # ever wants to preserve the index across an unmount, they can simply
-                # not refresh while the drive is offline.)
+                # Root is gone (typical case: unmounted USB / SD-card). Preserve
+                # the cached index — the user wants thumbnails to stay visible
+                # until the drive is reconnected. We deliberately do NOT add
+                # this category to scanned_categories so prune_missing leaves
+                # its rows alone. Truly-removed folders can be cleaned up via
+                # the Settings → Folders UI.
                 self.missing_root[category] = str(root)
-                scanned_categories.append(category)
                 continue
             self.missing_root.pop(category, None)
             scanned_categories.append(category)
             if root.is_symlink():
                 LOGGER.warning("Skipping symlink root folder: %s", root)
                 continue
-            
+
+            # Subtrees flagged "do not inherit" that live *strictly* inside the
+            # current root: their content belongs to their own category only.
+            # `is_relative_to(root)` would also be True for root itself; that
+            # case is excluded so a no-inherit folder still gets scanned as
+            # its own category.
+            skip_prefixes: list[Path] = []
+            for ex in excluded_paths:
+                try:
+                    if ex != root and ex.is_relative_to(root):
+                        skip_prefixes.append(ex)
+                except ValueError:
+                    continue
+
             for path in root.rglob("*"):
                 # Skip symlinks to prevent infinite loops and unexpected behavior
                 if path.is_symlink():
                     LOGGER.debug("Skipping symlink: %s", path)
                     continue
-                
+
                 if not path.is_file():
                     continue
-                
-                # Optional: Track visited directories (inode) to detect symlink loops
-                # This provides defense-in-depth if rglob() encounters symlinks
-                try:
-                    stat = path.stat()
-                    inode_key = (stat.st_dev, stat.st_ino)
-                    if inode_key in self._visited_inodes and path.is_dir():
-                        LOGGER.debug("Skipping already-visited directory (potential symlink loop): %s", path)
+
+                if skip_prefixes:
+                    if any(
+                        path == sp or sp in path.parents
+                        for sp in skip_prefixes
+                    ):
                         continue
-                    if path.is_dir():
-                        self._visited_inodes.add(inode_key)
+                
+                try:
+                    path.stat()
                 except (OSError, ValueError):
-                    # If we can't stat the path, skip it (broken symlink, permission denied, etc.)
+                    # If we can't stat the file, skip it (permission denied,
+                    # removed while scanning, broken filesystem entry, etc.).
                     LOGGER.debug("Skipping path that cannot be stat'd: %s", path)
                     continue
                 

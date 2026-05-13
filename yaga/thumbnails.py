@@ -11,6 +11,18 @@ from .config import THUMB_DIR
 from .models import MediaItem
 
 LOGGER = logging.getLogger(__name__)
+_VIDEO_THUMB_TIMEOUT_SEC = 20
+
+# Sync the decompression-bomb cap with editor/_pil.py at import time so the
+# scanner thumbnail path is also protected — a hostile NC server could
+# otherwise feed us a multi-gigapixel PNG that OOMs the worker pool when a
+# folder of NC items scrolls into view. Best-effort: if Pillow isn't
+# installed we degrade to GdkPixbuf for thumbnails anyway.
+try:
+    from PIL import Image as _PILImageInit  # noqa: N812 — module init, not a use
+    _PILImageInit.MAX_IMAGE_PIXELS = 200_000_000
+except ImportError:
+    pass
 
 
 class Thumbnailer:
@@ -83,6 +95,14 @@ class Thumbnailer:
                 img = img.convert("RGB")
             img.save(str(target), "JPEG", quality=85)
             return str(target)
+        except PILImage.DecompressionBombError:
+            # Refuse oversized images explicitly — a debug-level log buries
+            # this in noise, but the user (or admin) wants to know that a
+            # specific file was rejected for safety reasons.
+            LOGGER.warning(
+                "Skipping decompression-bomb image %s (exceeds %s pixels)",
+                path, PILImage.MAX_IMAGE_PIXELS,
+            )
         except Exception:
             LOGGER.debug("PIL thumbnail failed for %s", path, exc_info=True)
         
@@ -125,8 +145,20 @@ class Thumbnailer:
         else:
             return None
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_VIDEO_THUMB_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            LOGGER.warning("Video thumbnailer timed out for %s", path)
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
         except (OSError, subprocess.CalledProcessError):
             return None
         return str(target) if target.exists() else None
-

@@ -71,6 +71,19 @@ TRANSLATIONS = {
         "The name appears as the entry label in the gallery navigation.":
             "The name appears as the entry label in the gallery navigation.",
         "Path": "Path",
+        "Don't inherit": "Don't inherit",
+        "Parent folders won't include this folder's content during scans.":
+            "Parent folders won't include this folder's content during scans.",
+        "Show": "Show",
+        "Which media types appear when this folder is opened.":
+            "Which media types appear when this folder is opened.",
+        "Both": "Both",
+        "Images only": "Images only",
+        "Videos only": "Videos only",
+        "Hide": "Hide",
+        "All other folders combined": "All other folders combined",
+        "Overview shows the combined content of every other folder.":
+            "Overview shows the combined content of every other folder.",
         "Search": "Search",
         "Filename, date, month, EXIF…": "Filename, date, month, EXIF…",
         "Search: %d hits": "Search: %d hits",
@@ -115,14 +128,26 @@ TRANSLATIONS = {
         "Cancel selection": "Cancel selection",
         "Delete selected": "Delete selected",
         "Move selected": "Move selected",
+        "Share selected": "Share selected",
         "selected": "selected",
         "Delete selection?": "Delete selection?",
         "Photos will be moved to trash.": "Photos will be moved to trash.",
+        # Share dialog
+        "Share image": "Share image",
+        "Share %d images": "Share %d images",
+        "Choose how to share:": "Choose how to share:",
+        "Email": "Email",
+        "Cannot share Nextcloud items directly — open them first to download.":
+            "Cannot share Nextcloud items directly — open them first to download.",
+        "%d Nextcloud item(s) skipped (not downloaded locally).":
+            "%d Nextcloud item(s) skipped (not downloaded locally).",
         # Rotation
         "Save rotation?": "Save rotation?",
         "The image has been rotated. Save the change?": "The image has been rotated. Save the change?",
         "Discard": "Discard",
         "Save": "Save",
+        "Undo": "Undo",
+        "Redo": "Redo",
         # Viewer
         "Could not load file": "Could not load file",
         # Settings UI
@@ -151,6 +176,14 @@ TRANSLATIONS = {
         "Video": "Video",
         "External player command": "External player command",
         "Leave empty to use built-in playback": "Leave empty to use built-in playback",
+        "Diagnostics": "Diagnostics",
+        "Copy this when reporting camera, Nextcloud, or media-scan issues.":
+            "Copy this when reporting camera, Nextcloud, or media-scan issues.",
+        "Diagnostic report": "Diagnostic report",
+        "Includes paths, runtime versions, camera plugins, and status flags.":
+            "Includes paths, runtime versions, camera plugins, and status flags.",
+        "Copy": "Copy",
+        "Copied": "Copied",
         "Folder structure": "Folder structure",
         "All media": "All media",
         "No configured folder exists yet.": "No configured folder exists yet.",
@@ -174,6 +207,9 @@ TRANSLATIONS = {
         "Performance": "Performance",
         "Load thumbnails only": "Load thumbnails only",
         "Skip downloading full files during sync": "Skip downloading full files during sync",
+        "Show in Overview": "Show in Overview",
+        "Merge Nextcloud items into the Overview (thumbnails load on demand)":
+            "Merge Nextcloud items into the Overview (thumbnails load on demand)",
         "Connect": "Connect",
         "Disconnect": "Disconnect",
         "Connected ✓": "Connected ✓",
@@ -215,6 +251,22 @@ TRANSLATIONS = {
         "Dimensions": "Dimensions",
         "Modified": "Modified",
         "Size": "Size",
+        # Month names (date-sort headers). English defaults are identity
+        # mappings, but the keys are duplicated explicitly here so the
+        # translator never falls back to the bare key with a stale
+        # comment.
+        "January": "January",
+        "February": "February",
+        "March": "March",
+        "April": "April",
+        "May": "May",
+        "June": "June",
+        "July": "July",
+        "August": "August",
+        "September": "September",
+        "October": "October",
+        "November": "November",
+        "December": "December",
     },
     "de": {
         # Navigation / gallery
@@ -284,6 +336,20 @@ TRANSLATIONS = {
         "The name appears as the entry label in the gallery navigation.":
             "Der Name erscheint als Beschriftung in der Galerie-Navigation.",
         "Path": "Pfad",
+        "Don't inherit": "Nicht vererben",
+        "Parent folders won't include this folder's content during scans.":
+            "Übergeordnete Ordner berücksichtigen den Inhalt dieses Ordners "
+            "beim Scan nicht.",
+        "Show": "Anzeigen",
+        "Which media types appear when this folder is opened.":
+            "Welche Medientypen erscheinen, wenn dieser Ordner geöffnet wird.",
+        "Both": "Beides",
+        "Images only": "Nur Bilder",
+        "Videos only": "Nur Videos",
+        "Hide": "Ausblenden",
+        "All other folders combined": "Inhalt aller anderen Ordner",
+        "Overview shows the combined content of every other folder.":
+            "Übersicht zeigt den kombinierten Inhalt aller anderen Ordner.",
         "Search": "Suchen",
         "Filename, date, month, EXIF…": "Dateiname, Datum, Monat, EXIF…",
         "Search: %d hits": "Suche: %d Treffer",
@@ -328,14 +394,26 @@ TRANSLATIONS = {
         "Cancel selection": "Auswahl aufheben",
         "Delete selected": "Ausgewählte löschen",
         "Move selected": "Ausgewählte verschieben",
+        "Share selected": "Ausgewählte teilen",
         "selected": "ausgewählt",
         "Delete selection?": "Auswahl löschen?",
         "Photos will be moved to trash.": "Fotos werden in den Papierkorb verschoben.",
+        # Share dialog
+        "Share image": "Bild teilen",
+        "Share %d images": "%d Bilder teilen",
+        "Choose how to share:": "Übertragungsweg wählen:",
+        "Email": "E-Mail",
+        "Cannot share Nextcloud items directly — open them first to download.":
+            "Nextcloud-Elemente lassen sich nicht direkt teilen – bitte vorher öffnen, damit sie heruntergeladen werden.",
+        "%d Nextcloud item(s) skipped (not downloaded locally).":
+            "%d Nextcloud-Element(e) übersprungen (nicht lokal verfügbar).",
         # Rotation
         "Save rotation?": "Rotation speichern?",
         "The image has been rotated. Save the change?": "Das Bild wurde gedreht. Änderung speichern?",
         "Discard": "Verwerfen",
         "Save": "Speichern",
+        "Undo": "Rückgängig",
+        "Redo": "Wiederherstellen",
         # Viewer
         "Could not load file": "Datei konnte nicht geladen werden",
         # Settings UI
@@ -364,6 +442,14 @@ TRANSLATIONS = {
         "Video": "Video",
         "External player command": "Externer Player-Befehl",
         "Leave empty to use built-in playback": "Leer lassen für integrierte Wiedergabe",
+        "Diagnostics": "Diagnose",
+        "Copy this when reporting camera, Nextcloud, or media-scan issues.":
+            "Beim Melden von Kamera-, Nextcloud- oder Medien-Scan-Problemen kopieren.",
+        "Diagnostic report": "Diagnosebericht",
+        "Includes paths, runtime versions, camera plugins, and status flags.":
+            "Enthält Pfade, Laufzeitversionen, Kamera-Plugins und Statuswerte.",
+        "Copy": "Kopieren",
+        "Copied": "Kopiert",
         "Folder structure": "Ordnerstruktur",
         "All media": "Alle Medien",
         "No configured folder exists yet.": "Noch kein konfigurierter Ordner vorhanden.",
@@ -387,6 +473,9 @@ TRANSLATIONS = {
         "Performance": "Performance",
         "Load thumbnails only": "Nur Vorschaubilder laden",
         "Skip downloading full files during sync": "Beim Abgleich keine vollständigen Dateien herunterladen",
+        "Show in Overview": "In Übersicht anzeigen",
+        "Merge Nextcloud items into the Overview (thumbnails load on demand)":
+            "Nextcloud-Inhalte in die Übersicht einblenden (Vorschaubilder werden bei Bedarf geladen)",
         "Connect": "Verbinden",
         "Disconnect": "Trennen",
         "Connected ✓": "Verbunden ✓",
@@ -428,6 +517,19 @@ TRANSLATIONS = {
         "Dimensions": "Abmessungen",
         "Modified": "Geändert",
         "Size": "Größe",
+        # Month names (date-sort headers).
+        "January": "Januar",
+        "February": "Februar",
+        "March": "März",
+        "April": "April",
+        "May": "Mai",
+        "June": "Juni",
+        "July": "Juli",
+        "August": "August",
+        "September": "September",
+        "October": "Oktober",
+        "November": "November",
+        "December": "Dezember",
     },
 }
 

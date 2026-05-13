@@ -1,5 +1,13 @@
+"""EditorView — the GTK widget that orchestrates the editor pipeline.
+
+Pure-Pillow image operations (filters, frames, stickers, text) live in their
+own submodules; this module is the GTK glue: panel construction, gesture
+handlers, undo/redo, and the save/upload entry points.
+"""
+
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 
@@ -12,467 +20,16 @@ gi.require_version("PangoCairo", "1.0")
 
 from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
 
-from .models import MediaItem
+from ..models import MediaItem
+from ._pil import ImageDraw, ImageEnhance, ImageFilter, PILImage
+from .filters import _FILTER_DEFS
+from .frames import _FRAME_THEMES, _frame_pil
+from .stickers import _STICKER_GROUPS, _emoji_to_pil, _get_emoji_pil, _pil_to_texture
+from .text import _make_text_pil
 
-try:
-    from PIL import Image as PILImage, ImageEnhance, ImageFilter, ImageOps, ImageDraw
-    _PIL_OK = True
-except ImportError:
-    PILImage = ImageEnhance = ImageFilter = ImageOps = ImageDraw = None
-    _PIL_OK = False
+LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Sticker generators (drawn with Pillow at runtime, no external assets needed)
-# ---------------------------------------------------------------------------
 
-def _make_star(size: int = 96) -> "PILImage.Image":
-    img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy = size / 2, size / 2
-    r_out = size / 2 - 3
-    r_in = r_out * 0.38
-    pts = []
-    for i in range(10):
-        a = math.pi / 5 * i - math.pi / 2
-        r = r_out if i % 2 == 0 else r_in
-        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    draw.polygon(pts, fill=(255, 215, 0, 255))
-    return img
-
-
-def _make_heart(size: int = 96) -> "PILImage.Image":
-    img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy = size / 2, size / 2 + 2
-    sc = size / 36
-    pts = [(cx + 16 * math.sin(math.radians(i)) ** 3 * sc,
-            cy - (13 * math.cos(math.radians(i))
-                  - 5 * math.cos(math.radians(2 * i))
-                  - 2 * math.cos(math.radians(3 * i))
-                  - math.cos(math.radians(4 * i))) * sc)
-           for i in range(360)]
-    draw.polygon(pts, fill=(255, 60, 80, 255))
-    return img
-
-
-def _make_sparkle(size: int = 96) -> "PILImage.Image":
-    img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy = size / 2, size / 2
-    r_out = size / 2 - 3
-    r_in = r_out * 0.12
-    pts = []
-    for i in range(8):
-        a = math.pi / 4 * i - math.pi / 2
-        r = r_out if i % 2 == 0 else r_in
-        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    draw.polygon(pts, fill=(255, 255, 255, 230))
-    return img
-
-
-def _pil_to_texture(img: "PILImage.Image") -> Gdk.Texture:
-    rgba = img.convert("RGBA")
-    w, h = rgba.size
-    raw = rgba.tobytes()
-    gbytes = GLib.Bytes.new(raw)
-    return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, gbytes, w * 4)
-
-
-# ---------------------------------------------------------------------------
-# Emoji sticker rendering via Pango+Cairo
-# ---------------------------------------------------------------------------
-
-def _emoji_to_pil(char: str, size: int = 96) -> "PILImage.Image":
-    """Render an emoji character to a square PIL RGBA image using PangoCairo."""
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
-    cr = cairo.Context(surface)
-    layout = PangoCairo.create_layout(cr)
-    layout.set_text(char, -1)
-    PangoCairo.context_set_resolution(layout.get_context(), 96)
-    desc = Pango.FontDescription.from_string("Noto Color Emoji")
-    desc.set_absolute_size(int(size * 0.88) * Pango.SCALE)
-    layout.set_font_description(desc)
-    PangoCairo.update_layout(cr, layout)
-    _, ink = layout.get_pixel_extents()
-    w = ink.width or size
-    h = ink.height or size
-    cr.move_to(max(0.0, (size - w) / 2.0 - ink.x),
-               max(0.0, (size - h) / 2.0 - ink.y))
-    PangoCairo.show_layout(cr, layout)
-    data = bytes(surface.get_data())
-    return PILImage.frombytes("RGBA", (size, size), data, "raw", "BGRA")
-
-
-_STICKER_GROUPS: list[tuple[str, list[str]]] = [
-    ("Smileys",         ["😀", "😂", "🥰", "😎", "🤩", "🥳", "😇", "🙈"]),
-    ("Herzen & Sterne", ["❤", "🧡", "💛", "💚", "💙", "💜", "⭐", "🌟"]),
-    ("Symbole",         ["🔥", "💫", "✨", "🎉", "🎊", "🌈", "🏆", "💬"]),
-]
-
-# Cache rendered emoji at a fixed master size; rescale on demand.
-_EMOJI_PIL_CACHE: "dict[str, PILImage.Image]" = {}
-
-
-def _get_emoji_pil(char: str, px: int) -> "PILImage.Image":
-    _MASTER = 256
-    if char not in _EMOJI_PIL_CACHE:
-        _EMOJI_PIL_CACHE[char] = _emoji_to_pil(char, _MASTER)
-    base = _EMOJI_PIL_CACHE[char]
-    if px == _MASTER:
-        return base
-    return base.resize((px, px), PILImage.LANCZOS)
-
-
-# ---------------------------------------------------------------------------
-# Frame themes
-# ---------------------------------------------------------------------------
-
-_FRAME_THEMES: list[tuple[str, str, tuple[int, int, int], tuple[int, int, int]]] = [
-    ("christmas",  "Christmas",   (180, 28,  32),  (20,  115, 64)),
-    ("silvester",  "New Year",    (25,  24,  34),  (255, 211, 84)),
-    ("ostern",     "Easter",      (255, 176, 222), (128, 207, 130)),
-    ("hochzeit",   "Wedding",     (255, 252, 242), (207, 181, 132)),
-    ("geburtstag", "Birthday",    (255, 96,  165), (255, 215, 48)),
-    ("fruehling",  "Spring",      (126, 204, 120), (255, 176, 214)),
-    ("sommer",     "Summer",      (255, 205, 58),  (34,  174, 210)),
-    ("winter",     "Winter",      (188, 226, 255), (86,  147, 220)),
-]
-
-
-def _frame_pil(iw: int, ih: int, theme: str) -> "PILImage.Image | None":
-    """Transparent RGBA decorative border overlay."""
-    theme_data = {t[0]: (t[2], t[3]) for t in _FRAME_THEMES}
-    if theme not in theme_data:
-        return None
-    c1, c2 = theme_data[theme]
-    frame = PILImage.new("RGBA", (iw, ih), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(frame)
-    bw = max(28, min(iw, ih) // 8)
-    _draw_soft_border(draw, iw, ih, bw, c1, c2)
-    if theme == "christmas":
-        _decorate_christmas(draw, iw, ih, bw)
-    elif theme == "silvester":
-        _decorate_new_year(draw, iw, ih, bw)
-    elif theme == "ostern":
-        _decorate_easter(draw, iw, ih, bw)
-    elif theme == "hochzeit":
-        _decorate_wedding(draw, iw, ih, bw)
-    elif theme == "geburtstag":
-        _decorate_birthday(draw, iw, ih, bw)
-    elif theme == "fruehling":
-        _decorate_spring(draw, iw, ih, bw)
-    elif theme == "sommer":
-        _decorate_summer(draw, iw, ih, bw)
-    elif theme == "winter":
-        _decorate_winter(draw, iw, ih, bw)
-    return frame
-
-
-def _draw_soft_border(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int, c1: tuple, c2: tuple) -> None:
-    shade = (0, 0, 0, 68)
-    draw.rectangle([0, 0, iw, bw], fill=c1 + (110,))
-    draw.rectangle([0, ih - bw, iw, ih], fill=c1 + (110,))
-    draw.rectangle([0, 0, bw, ih], fill=c2 + (88,))
-    draw.rectangle([iw - bw, 0, iw, ih], fill=c2 + (88,))
-    for i in range(max(2, bw // 12)):
-        draw.rectangle([i, i, iw - i - 1, ih - i - 1], outline=shade)
-    ribbon = max(5, bw // 6)
-    draw.rounded_rectangle([ribbon, ribbon, iw - ribbon - 1, ih - ribbon - 1], radius=bw // 2, outline=(255, 255, 255, 120), width=max(2, ribbon // 2))
-    draw.rounded_rectangle([bw // 2, bw // 2, iw - bw // 2 - 1, ih - bw // 2 - 1], radius=bw // 2, outline=c2 + (220,), width=max(2, bw // 10))
-    draw.rounded_rectangle([bw, bw, iw - bw - 1, ih - bw - 1], radius=bw // 3, outline=(255, 255, 255, 155), width=max(1, bw // 18))
-
-
-def _edge_positions(length: int, margin: int, count: int) -> list[int]:
-    if count <= 1:
-        return [length // 2]
-    usable = max(1, length - margin * 2)
-    return [margin + round(usable * i / (count - 1)) for i in range(count)]
-
-
-def _draw_star_shape(draw: ImageDraw.ImageDraw, x: float, y: float, r: float, color: tuple, points: int = 5) -> None:
-    coords = []
-    for i in range(points * 2):
-        angle = math.pi * i / points - math.pi / 2
-        radius = r if i % 2 == 0 else r * 0.42
-        coords.append((x + math.cos(angle) * radius, y + math.sin(angle) * radius))
-    draw.polygon(coords, fill=color)
-
-
-def _draw_flower(draw: ImageDraw.ImageDraw, x: float, y: float, r: float, petal: tuple, center: tuple) -> None:
-    for angle in range(0, 360, 60):
-        dx = math.cos(math.radians(angle)) * r * 0.75
-        dy = math.sin(math.radians(angle)) * r * 0.75
-        draw.ellipse([x + dx - r * 0.45, y + dy - r * 0.45, x + dx + r * 0.45, y + dy + r * 0.45], fill=petal)
-    draw.ellipse([x - r * 0.38, y - r * 0.38, x + r * 0.38, y + r * 0.38], fill=center)
-
-
-def _draw_snowflake(draw: ImageDraw.ImageDraw, x: float, y: float, r: float, color: tuple) -> None:
-    for angle in range(0, 180, 30):
-        dx = math.cos(math.radians(angle)) * r
-        dy = math.sin(math.radians(angle)) * r
-        draw.line([x - dx, y - dy, x + dx, y + dy], fill=color, width=max(1, int(r // 8)))
-
-
-def _draw_bow(draw: ImageDraw.ImageDraw, x: float, y: float, r: float, color: tuple, knot: tuple) -> None:
-    draw.polygon([(x, y), (x - r, y - r * 0.55), (x - r, y + r * 0.55)], fill=color)
-    draw.polygon([(x, y), (x + r, y - r * 0.55), (x + r, y + r * 0.55)], fill=color)
-    draw.ellipse([x - r * 0.24, y - r * 0.24, x + r * 0.24, y + r * 0.24], fill=knot)
-    draw.line([x - r * 0.35, y + r * 0.45, x - r * 0.62, y + r * 1.05], fill=color, width=max(2, int(r // 5)))
-    draw.line([x + r * 0.35, y + r * 0.45, x + r * 0.62, y + r * 1.05], fill=color, width=max(2, int(r // 5)))
-
-
-def _draw_leaf(draw: ImageDraw.ImageDraw, x: float, y: float, r: float, angle: float, color: tuple) -> None:
-    dx = math.cos(angle) * r
-    dy = math.sin(angle) * r
-    x0 = x - dx - r * 0.35
-    y0 = y - dy - r * 0.18
-    x1 = x + dx + r * 0.35
-    y1 = y + dy + r * 0.18
-    draw.ellipse([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=color)
-
-
-def _draw_gift(draw: ImageDraw.ImageDraw, x: float, y: float, s: float, box: tuple, ribbon: tuple) -> None:
-    draw.rounded_rectangle([x - s, y - s * 0.55, x + s, y + s], radius=max(2, int(s // 8)), fill=box)
-    draw.rectangle([x - s, y - s * 0.12, x + s, y + s * 0.10], fill=ribbon)
-    draw.rectangle([x - s * 0.12, y - s * 0.55, x + s * 0.12, y + s], fill=ribbon)
-    _draw_bow(draw, x, y - s * 0.62, s * 0.35, ribbon, (255, 255, 255, 210))
-
-
-def _draw_palm(draw: ImageDraw.ImageDraw, x: float, y: float, r: float) -> None:
-    trunk = (132, 89, 45, 225)
-    leaf = (36, 151, 91, 232)
-    draw.line([x, y, x + r * 0.20, y + r * 1.35], fill=trunk, width=max(3, int(r // 6)))
-    for angle in [-2.7, -2.25, -1.85, -1.35, -0.95, -0.55]:
-        ex = x + math.cos(angle) * r
-        ey = y + math.sin(angle) * r * 0.62
-        draw.line([x, y, ex, ey], fill=leaf, width=max(3, int(r // 8)))
-        _draw_leaf(draw, (x + ex) / 2, (y + ey) / 2, r * 0.24, angle, leaf)
-
-
-def _decorate_christmas(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    green = (30, 128, 72, 235)
-    red = (218, 40, 45, 245)
-    gold = (255, 218, 86, 240)
-    for x in _edge_positions(iw, bw, 15):
-        y = bw * 0.55 + math.sin(x / max(1, iw) * math.tau * 3) * bw * 0.16
-        draw.line([x - bw * 0.35, y, x + bw * 0.35, y], fill=green, width=max(3, bw // 10))
-        for angle in [-0.8, -0.35, 0.35, 0.8]:
-            _draw_leaf(draw, x, y, bw * 0.24, angle, green)
-        draw.ellipse([x - bw * 0.13, y - bw * 0.13, x + bw * 0.13, y + bw * 0.13], fill=red)
-        if int(x) % 3 == 0:
-            _draw_star_shape(draw, x, y + bw * 0.45, bw * 0.18, gold)
-    for x, y in [(bw, bw), (iw - bw, bw), (bw, ih - bw), (iw - bw, ih - bw)]:
-        _draw_star_shape(draw, x, y, bw * 0.62, gold)
-        _draw_bow(draw, x, y + bw * 0.55, bw * 0.42, red, gold)
-
-
-def _decorate_new_year(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    colors = [(255, 215, 74, 245), (119, 216, 255, 230), (255, 95, 126, 230), (180, 130, 255, 225)]
-    centers = [(bw * 1.3, bw * 1.2), (iw - bw * 1.4, bw * 1.35), (iw * 0.5, ih - bw * 0.95), (iw * 0.5, bw * 0.8)]
-    for idx, (cx, cy) in enumerate(centers):
-        for ray in range(12):
-            angle = math.tau * ray / 12
-            r1 = bw * 0.18
-            r2 = bw * (0.55 + 0.12 * (ray % 2))
-            color = colors[(idx + ray) % len(colors)]
-            draw.line([cx + math.cos(angle) * r1, cy + math.sin(angle) * r1, cx + math.cos(angle) * r2, cy + math.sin(angle) * r2], fill=color, width=max(1, bw // 12))
-    for i, x in enumerate(_edge_positions(iw, bw, 12)):
-        _draw_star_shape(draw, x, bw * 0.48 if i % 2 else ih - bw * 0.48, bw * 0.16, colors[i % len(colors)], points=4)
-    for i, x in enumerate(_edge_positions(iw, bw, 18)):
-        y = bw * 0.92 if i % 2 else ih - bw * 0.92
-        draw.ellipse([x - bw * 0.08, y - bw * 0.08, x + bw * 0.08, y + bw * 0.08], fill=colors[(i + 2) % len(colors)])
-
-
-def _decorate_easter(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    egg_colors = [(255, 185, 218, 238), (167, 220, 143, 238), (255, 232, 122, 238), (156, 205, 255, 238)]
-    for i, x in enumerate(_edge_positions(iw, bw, 8)):
-        y = ih - bw * 0.58
-        color = egg_colors[i % len(egg_colors)]
-        draw.ellipse([x - bw * 0.23, y - bw * 0.34, x + bw * 0.23, y + bw * 0.34], fill=color)
-        draw.arc([x - bw * 0.17, y - bw * 0.10, x + bw * 0.17, y + bw * 0.22], 0, 180, fill=(255, 255, 255, 210), width=max(1, bw // 12))
-    for y in _edge_positions(ih, bw, 6):
-        _draw_flower(draw, bw * 0.45, y, bw * 0.20, (255, 220, 236, 230), (255, 200, 76, 245))
-    for x in [bw * 1.15, iw - bw * 1.15]:
-        y = bw * 0.92
-        draw.ellipse([x - bw * 0.42, y - bw * 0.85, x - bw * 0.08, y], fill=(255, 245, 250, 230))
-        draw.ellipse([x + bw * 0.08, y - bw * 0.85, x + bw * 0.42, y], fill=(255, 245, 250, 230))
-        draw.ellipse([x - bw * 0.55, y - bw * 0.28, x + bw * 0.55, y + bw * 0.52], fill=(255, 250, 252, 230))
-
-
-def _decorate_wedding(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    pearl = (255, 255, 246, 230)
-    gold = (214, 181, 104, 230)
-    for x in _edge_positions(iw, bw // 2, 18):
-        draw.ellipse([x - bw * 0.09, bw * 0.42 - bw * 0.09, x + bw * 0.09, bw * 0.42 + bw * 0.09], fill=pearl)
-        draw.ellipse([x - bw * 0.09, ih - bw * 0.42 - bw * 0.09, x + bw * 0.09, ih - bw * 0.42 + bw * 0.09], fill=pearl)
-    cx, cy = iw - bw * 1.25, bw * 1.05
-    draw.ellipse([cx - bw * 0.55, cy - bw * 0.30, cx + bw * 0.05, cy + bw * 0.30], outline=gold, width=max(2, bw // 8))
-    draw.ellipse([cx - bw * 0.05, cy - bw * 0.30, cx + bw * 0.55, cy + bw * 0.30], outline=gold, width=max(2, bw // 8))
-    for x, y in [(bw, ih - bw), (iw - bw, ih - bw), (bw, bw)]:
-        _draw_flower(draw, x, y, bw * 0.33, (255, 255, 255, 235), gold)
-        _draw_flower(draw, x + bw * 0.45, y - bw * 0.05, bw * 0.22, (255, 235, 242, 220), gold)
-
-
-def _decorate_birthday(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    colors = [(255, 74, 134, 238), (255, 211, 58, 238), (74, 190, 255, 238), (132, 224, 109, 238)]
-    for i, x in enumerate(_edge_positions(iw, bw, 7)):
-        y = bw * 0.72
-        color = colors[i % len(colors)]
-        draw.ellipse([x - bw * 0.22, y - bw * 0.34, x + bw * 0.22, y + bw * 0.30], fill=color)
-        draw.line([x, y + bw * 0.30, x - bw * 0.10, y + bw * 0.70], fill=(255, 255, 255, 180), width=max(1, bw // 12))
-    for i, x in enumerate(_edge_positions(iw, bw, 14)):
-        draw.rectangle([x, ih - bw * 0.65, x + bw * 0.12, ih - bw * 0.53], fill=colors[i % len(colors)])
-    for i, x in enumerate(_edge_positions(iw, bw, 9)):
-        y = bw * 0.12
-        draw.polygon([(x - bw * 0.28, y), (x + bw * 0.28, y), (x, y + bw * 0.52)], fill=colors[(i + 1) % len(colors)])
-    _draw_gift(draw, bw * 1.1, ih - bw * 0.72, bw * 0.48, colors[0], colors[1])
-    _draw_gift(draw, iw - bw * 1.1, ih - bw * 0.72, bw * 0.48, colors[2], colors[3])
-
-
-def _decorate_spring(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    petals = [(255, 177, 213, 235), (255, 229, 119, 235), (184, 222, 112, 235)]
-    for i, x in enumerate(_edge_positions(iw, bw, 10)):
-        _draw_flower(draw, x, bw * 0.55, bw * 0.18, petals[i % len(petals)], (255, 214, 77, 245))
-    for i, y in enumerate(_edge_positions(ih, bw, 8)):
-        draw.ellipse([iw - bw * 0.66, y - bw * 0.16, iw - bw * 0.30, y + bw * 0.13], fill=(89, 170, 91, 220))
-    for x, y in [(bw * 0.95, ih - bw * 0.85), (iw - bw * 0.95, ih - bw * 0.85)]:
-        for k in range(5):
-            _draw_flower(draw, x + (k - 2) * bw * 0.22, y - abs(k - 2) * bw * 0.10, bw * 0.24, petals[k % len(petals)], (255, 220, 70, 245))
-
-
-def _decorate_summer(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    sun = (255, 214, 58, 245)
-    water = (44, 180, 214, 225)
-    _draw_star_shape(draw, bw * 1.10, bw * 1.05, bw * 0.90, sun, points=18)
-    _draw_palm(draw, iw - bw * 0.85, bw * 0.95, bw * 0.88)
-    for x in _edge_positions(iw, bw, 12):
-        y = ih - bw * 0.48
-        draw.arc([x - bw * 0.22, y - bw * 0.12, x + bw * 0.22, y + bw * 0.24], 0, 180, fill=water, width=max(2, bw // 10))
-    for x, y in [(iw - bw * 1.15, bw * 0.95), (iw - bw * 0.72, bw * 1.32)]:
-        draw.ellipse([x - bw * 0.18, y - bw * 0.12, x + bw * 0.18, y + bw * 0.12], fill=(255, 245, 205, 235))
-    draw.pieslice([bw * 0.45, ih - bw * 1.25, bw * 1.85, ih + bw * 0.15], 180, 360, fill=(255, 102, 92, 230))
-    draw.line([bw * 1.15, ih - bw * 0.58, bw * 0.95, ih - bw * 0.15], fill=(255, 255, 255, 220), width=max(2, bw // 10))
-
-
-def _decorate_winter(draw: ImageDraw.ImageDraw, iw: int, ih: int, bw: int) -> None:
-    snow = (245, 252, 255, 240)
-    blue = (138, 197, 245, 225)
-    for i, x in enumerate(_edge_positions(iw, bw, 9)):
-        _draw_snowflake(draw, x, bw * 0.55, bw * (0.18 + 0.04 * (i % 2)), snow)
-        _draw_snowflake(draw, x, ih - bw * 0.55, bw * 0.16, blue)
-    for y in _edge_positions(ih, bw, 7):
-        draw.ellipse([bw * 0.36, y - bw * 0.08, bw * 0.52, y + bw * 0.08], fill=snow)
-    for x in _edge_positions(iw, bw, 12):
-        draw.polygon([(x - bw * 0.12, 0), (x + bw * 0.12, 0), (x, bw * 0.62)], fill=(228, 246, 255, 210))
-    _draw_snowflake(draw, iw - bw * 1.05, bw * 1.10, bw * 0.56, snow)
-    _draw_snowflake(draw, bw * 1.05, ih - bw * 1.10, bw * 0.48, snow)
-
-
-def _make_text_pil(text: str, font_size: int, color: tuple) -> "PILImage.Image":
-    """Render text to a transparent RGBA PIL image via PangoCairo (with outline)."""
-    msurf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
-    mcr = cairo.Context(msurf)
-    layout = PangoCairo.create_layout(mcr)
-    layout.set_text(text, -1)
-    PangoCairo.context_set_resolution(layout.get_context(), 96)
-    desc = Pango.FontDescription.from_string("Sans Bold")
-    desc.set_absolute_size(font_size * Pango.SCALE)
-    layout.set_font_description(desc)
-    PangoCairo.update_layout(mcr, layout)
-    _, ink = layout.get_pixel_extents()
-    w = max(1, ink.width) + 12
-    h = max(1, ink.height) + 12
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
-    cr = cairo.Context(surface)
-    ox, oy = -ink.x + 6, -ink.y + 6
-    layout2 = PangoCairo.create_layout(cr)
-    layout2.set_text(text, -1)
-    PangoCairo.context_set_resolution(layout2.get_context(), 96)
-    layout2.set_font_description(desc)
-    PangoCairo.update_layout(cr, layout2)
-    cr.move_to(ox, oy)
-    cr.set_source_rgba(0, 0, 0, 0.75)
-    PangoCairo.layout_path(cr, layout2)
-    cr.set_line_width(4.0)
-    cr.stroke()
-    cr.move_to(ox, oy)
-    cr.set_source_rgba(color[0] / 255, color[1] / 255, color[2] / 255, 1.0)
-    PangoCairo.show_layout(cr, layout2)
-    data = bytes(surface.get_data())
-    return PILImage.frombytes("RGBA", (w, h), data, "raw", "BGRA")
-
-
-# ---------------------------------------------------------------------------
-# Filter presets (PIL, each takes/returns RGB Image)
-# ---------------------------------------------------------------------------
-
-def _filter_bw(img: "PILImage.Image") -> "PILImage.Image":
-    return ImageOps.grayscale(img).convert("RGB")
-
-
-def _filter_sepia(img: "PILImage.Image") -> "PILImage.Image":
-    return img.convert("RGB", matrix=(
-        0.393, 0.769, 0.189, 0,
-        0.349, 0.686, 0.168, 0,
-        0.272, 0.534, 0.131, 0,
-    ))
-
-
-def _filter_warm(img: "PILImage.Image") -> "PILImage.Image":
-    r, g, b = img.split()
-    r = r.point(lambda x: min(255, int(x * 1.18)))
-    g = g.point(lambda x: min(255, int(x * 1.04)))
-    b = b.point(lambda x: max(0,   int(x * 0.82)))
-    return PILImage.merge("RGB", (r, g, b))
-
-
-def _filter_cool(img: "PILImage.Image") -> "PILImage.Image":
-    r, g, b = img.split()
-    r = r.point(lambda x: max(0,   int(x * 0.82)))
-    g = g.point(lambda x: min(255, int(x * 1.02)))
-    b = b.point(lambda x: min(255, int(x * 1.20)))
-    return PILImage.merge("RGB", (r, g, b))
-
-
-def _filter_fade(img: "PILImage.Image") -> "PILImage.Image":
-    result = ImageEnhance.Contrast(img).enhance(0.68)
-    result = ImageEnhance.Brightness(result).enhance(1.06)
-    return result.point(lambda x: int(x * 0.83 + 28))
-
-
-def _filter_dramatic(img: "PILImage.Image") -> "PILImage.Image":
-    result = ImageEnhance.Contrast(img).enhance(1.85)
-    return ImageEnhance.Color(result).enhance(0.55)
-
-
-def _filter_vintage(img: "PILImage.Image") -> "PILImage.Image":
-    result = ImageEnhance.Color(img).enhance(0.65)
-    result = ImageEnhance.Contrast(result).enhance(0.88)
-    r, g, b = result.split()
-    r = r.point(lambda x: min(255, int(x * 1.12 + 8)))
-    g = g.point(lambda x: min(255, int(x * 1.04)))
-    b = b.point(lambda x: max(0,   int(x * 0.80)))
-    return PILImage.merge("RGB", (r, g, b))
-
-
-def _filter_invert(img: "PILImage.Image") -> "PILImage.Image":
-    return ImageOps.invert(img)
-
-
-_FILTER_DEFS: list[tuple[str, str, object]] = [
-    ("none",      "Original",    None),
-    ("bw",        "S/W",         _filter_bw),
-    ("sepia",     "Sepia",       _filter_sepia),
-    ("warm",      "Warm",        _filter_warm),
-    ("cool",      "Kalt",        _filter_cool),
-    ("fade",      "Verblasst",   _filter_fade),
-    ("dramatic",  "Dramatisch",  _filter_dramatic),
-    ("vintage",   "Vintage",     _filter_vintage),
-    ("invert",    "Invertieren", _filter_invert),
-]
-
-
-# ---------------------------------------------------------------------------
 class EditorView(Gtk.Box):
     """In-app image editor with collapsible bottom-nav panels."""
 
@@ -526,11 +83,23 @@ class EditorView(Gtk.Box):
         self._obfuscate_brush_size: float = 0.08
         self._obfuscate_drag_origin: tuple[float, float] | None = None
 
-        # Undo/Redo history
-        self._history_undo: list["PILImage.Image"] = []
-        self._history_redo: list["PILImage.Image"] = []
+        # Undo/Redo history — snapshots are full state dicts, not just _working,
+        # because most edits (filter, brightness, stickers, frame, obfuscate) are
+        # parameters applied non-destructively in _apply_edits(); a working-only
+        # snapshot would leave those parameters intact and undo would do nothing.
+        self._history_undo: list[dict] = []
+        self._history_redo: list[dict] = []
         self._history_max_steps: int = 20  # Limit memory usage
-        self._slider_snapshot_id: int | None = None  # Debounce timer for slider changes
+        # Slider drag tracking: snapshot pre-change on first move in a drag,
+        # then suppress until the user pauses long enough to end the drag.
+        self._slider_drag_end_id: int | None = None
+        self._slider_drag_active: set[str] = set()
+        # Set during _restore_state to suppress snapshot side-effects in handlers
+        # that get fired by programmatic widget updates (sliders, toggles).
+        self._restoring: bool = False
+        # Slider widgets — populated in _build_panel_adjust, used by _restore_state
+        # to push restored values back into the UI.
+        self._adjust_sliders: dict[str, Gtk.Scale] = {}
 
         self._active_panel: str | None = None
         self._update_id: int | None = None
@@ -605,6 +174,15 @@ class EditorView(Gtk.Box):
         # ── Nav bar (orientation flipped on landscape vs portrait) ──
         self._nav_box = Gtk.Box(spacing=0)
         self._nav_box.add_css_class("toolbar")
+        self._nav_box.add_css_class("editor-nav")
+        # Wrap the nav in a ScrolledWindow so it can scroll on narrow viewports
+        # rather than clipping the buttons. Policy is flipped together with the
+        # orientation in _apply_orientation.
+        self._nav_scroller = Gtk.ScrolledWindow()
+        self._nav_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self._nav_scroller.set_propagate_natural_width(False)
+        self._nav_scroller.set_propagate_natural_height(False)
+        self._nav_scroller.set_child(self._nav_box)
 
         self._nav_btns: dict[str, Gtk.ToggleButton] = {}
         # Labels we hide on landscape (icon-only, ~50px strip).
@@ -663,7 +241,7 @@ class EditorView(Gtk.Box):
             return
         self._is_landscape = landscape
         # Detach current children (a widget can only have one parent in GTK4).
-        for child in (self._image_overlay, self._panel_revealer, self._nav_box):
+        for child in (self._image_overlay, self._panel_revealer, self._nav_scroller):
             parent = child.get_parent()
             if parent is self:
                 self.remove(child)
@@ -680,6 +258,9 @@ class EditorView(Gtk.Box):
             # Icon-only narrow strip (~50 px). Tooltips already carry the label.
             for lbl in self._nav_labels:
                 lbl.set_visible(False)
+            self._nav_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            self._nav_scroller.set_hexpand(False)
+            self._nav_scroller.set_vexpand(True)
             self._panel_revealer.set_transition_type(
                 Gtk.RevealerTransitionType.SLIDE_RIGHT
             )
@@ -700,7 +281,7 @@ class EditorView(Gtk.Box):
             # Sticker category buttons become a vertical sub-menu strip too.
             if hasattr(self, "_sticker_cat_box"):
                 self._sticker_cat_box.set_orientation(Gtk.Orientation.VERTICAL)
-            self.append(self._nav_box)
+            self.append(self._nav_scroller)
             self.append(self._panel_revealer)
             self.append(self._image_overlay)
         else:
@@ -709,15 +290,19 @@ class EditorView(Gtk.Box):
             self._nav_box.set_orientation(Gtk.Orientation.HORIZONTAL)
             self._nav_box.set_hexpand(True)
             self._nav_box.set_vexpand(False)
-            # Equal-width buttons across the toolbar — keeps the portrait
-            # nav looking the way the original (pre-landscape-refactor)
-            # implementation did.
-            self._nav_box.set_homogeneous(True)
+            # Drop the homogeneous distribution so each button uses its
+            # natural width; on narrow viewports the row exceeds the viewport
+            # and the wrapping ScrolledWindow scrolls horizontally instead of
+            # clipping the labels.
+            self._nav_box.set_homogeneous(False)
             for btn in self._nav_btns.values():
                 btn.set_hexpand(True)
                 btn.set_vexpand(False)
             for lbl in self._nav_labels:
                 lbl.set_visible(True)
+            self._nav_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+            self._nav_scroller.set_hexpand(True)
+            self._nav_scroller.set_vexpand(False)
             self._panel_revealer.set_transition_type(
                 Gtk.RevealerTransitionType.SLIDE_UP
             )
@@ -740,7 +325,7 @@ class EditorView(Gtk.Box):
                 self._sticker_cat_box.set_orientation(Gtk.Orientation.HORIZONTAL)
             self.append(self._image_overlay)
             self.append(self._panel_revealer)
-            self.append(self._nav_box)
+            self.append(self._nav_scroller)
 
     # ── Panel builders ──
 
@@ -820,6 +405,7 @@ class EditorView(Gtk.Box):
             sc.set_hexpand(True)
             sc.set_draw_value(False)
             sc.connect("value-changed", self._on_slider, attr)
+            self._adjust_sliders[attr] = sc
             reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
             reset.add_css_class("flat")
             reset.set_tooltip_text(self._("Reset"))
@@ -1015,6 +601,16 @@ class EditorView(Gtk.Box):
             self._sticker_sub_revealer.set_reveal_child(False)
 
     def _on_frame_toggled(self, btn: Gtk.ToggleButton, theme) -> None:
+        if self._restoring:
+            return
+        if btn.get_active():
+            new_theme = theme
+        else:
+            new_theme = None
+        # Skip snapshot if theme isn't actually changing (prevents empty
+        # history entries when our own deselect-blocking logic re-fires the handler).
+        if new_theme != self._frame_theme:
+            self._snapshot_state()
         if btn.get_active():
             for k, b in self._frame_btns.items():
                 if k != (theme or "none") and b.get_active():
@@ -1165,6 +761,8 @@ class EditorView(Gtk.Box):
     def _on_filter_toggled(self, btn: Gtk.ToggleButton, mode: str) -> None:
         if not btn.get_active():
             return
+        if self._restoring:
+            return
         self._snapshot_state()  # Save state before filter change
         self._filter_mode = mode
         for m, b in self._filter_btns.items():
@@ -1218,23 +816,32 @@ class EditorView(Gtk.Box):
         self._schedule_update()
 
     def _on_slider(self, sc: Gtk.Scale, attr: str) -> None:
+        if self._restoring:
+            return
+        # Snapshot the *pre-change* state on the first move of a drag, so undo
+        # restores the value the slider had before this drag began. Suppress
+        # further snapshots until the drag-end debouncer fires.
+        if attr not in self._slider_drag_active:
+            self._snapshot_state()
+            self._slider_drag_active.add(attr)
         setattr(self, attr, sc.get_value())
         self._schedule_update()
-        self._schedule_slider_snapshot()
+        self._schedule_slider_drag_end()
 
-    def _schedule_slider_snapshot(self) -> None:
-        """Schedule a debounced snapshot for slider changes (500ms delay)."""
-        if self._slider_snapshot_id is not None:
-            GLib.source_remove(self._slider_snapshot_id)
-        self._slider_snapshot_id = GLib.timeout_add(500, self._slider_snapshot_cb)
+    def _schedule_slider_drag_end(self) -> None:
+        """Reset drag tracking 500ms after the user stops moving any slider."""
+        if self._slider_drag_end_id is not None:
+            GLib.source_remove(self._slider_drag_end_id)
+        self._slider_drag_end_id = GLib.timeout_add(500, self._slider_drag_end_cb)
 
-    def _slider_snapshot_cb(self) -> bool:
-        """Called after slider movement stops (debounce callback)."""
-        self._slider_snapshot_id = None
-        self._snapshot_state()
+    def _slider_drag_end_cb(self) -> bool:
+        self._slider_drag_end_id = None
+        self._slider_drag_active.clear()
         return GLib.SOURCE_REMOVE
 
     def _reset_slider(self, _button: Gtk.Button, attr: str, scale: Gtk.Scale) -> None:
+        if self._restoring:
+            return
         self._snapshot_state()  # Save state before reset
         setattr(self, attr, 1.0)
         scale.set_value(1.0)
@@ -1263,6 +870,10 @@ class EditorView(Gtk.Box):
 
     def _on_sticker_zoom_begin(self, _g: Gtk.GestureZoom, _seq) -> None:
         self._sticker_zoom_start = self._sticker_size_frac
+        # Snapshot pre-resize state so the pinch is one undo step. Skip when
+        # there's nothing to resize — the scale handler bails on no source too.
+        if self._sticker_source is not None:
+            self._snapshot_state()
 
     def _on_sticker_zoom_scale(self, _g: Gtk.GestureZoom, scale_delta: float) -> None:
         if self._sticker_source is None:
@@ -1297,6 +908,8 @@ class EditorView(Gtk.Box):
     def _on_drag_begin(self, _g: Gtk.GestureDrag, x: float, y: float) -> None:
         self._drag_sticker = False
         if self._obfuscate_mode:
+            # Snapshot before the first stroke is appended — one drag = one undo step.
+            self._snapshot_state()
             self._obfuscate_drag_origin = (x, y)
             self._add_obfuscate_stroke(x, y)
             return
@@ -1315,6 +928,9 @@ class EditorView(Gtk.Box):
                 self._crop_start = (x, y)
                 self._crop_current = (x, y)
         elif self._stickers:
+            # Snapshot before the move/select changes _active_sticker and the
+            # sticker's rel position; one drag = one undo step.
+            self._snapshot_state()
             self._drag_sticker = True
             self._active_sticker = len(self._stickers) - 1
             self._sync_active_sticker()
@@ -1616,15 +1232,79 @@ class EditorView(Gtk.Box):
     # Undo/Redo
     # ------------------------------------------------------------------
 
+    def set_history_changed_callback(self, callback) -> None:
+        """Register a callback fired whenever the undo/redo stacks change.
+        The host (ViewerWindow) uses this to keep its toolbar buttons'
+        sensitivity in sync without polling."""
+        self._history_changed_cb = callback
+        # Fire once so the host picks up the initial (empty) state.
+        callback()
+
+    def _emit_history_changed(self) -> None:
+        cb = getattr(self, "_history_changed_cb", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                LOGGER.debug("history-changed callback raised", exc_info=True)
+
+    def _capture_state(self) -> dict:
+        """Snapshot every field that affects the rendered image."""
+        return {
+            "working": self._working.copy(),
+            "filter_mode": self._filter_mode,
+            "brightness": self._brightness,
+            "contrast": self._contrast,
+            "red": self._red,
+            "green": self._green,
+            "blue": self._blue,
+            "stickers": [dict(s) for s in self._stickers],
+            "active_sticker": self._active_sticker,
+            "obfuscate_strokes": list(self._obfuscate_strokes),
+            "frame_theme": self._frame_theme,
+        }
+
+    def _restore_state(self, state: dict) -> None:
+        """Apply a snapshot and push the restored values back into the UI widgets.
+
+        The _restoring flag suppresses the snapshot side-effects that filter /
+        frame / slider handlers would otherwise trigger when we set their
+        widgets programmatically below.
+        """
+        self._restoring = True
+        try:
+            self._working = state["working"]
+            self._filter_mode = state["filter_mode"]
+            self._brightness = state["brightness"]
+            self._contrast = state["contrast"]
+            self._red = state["red"]
+            self._green = state["green"]
+            self._blue = state["blue"]
+            self._stickers = [dict(s) for s in state["stickers"]]
+            self._active_sticker = state["active_sticker"]
+            self._obfuscate_strokes = list(state["obfuscate_strokes"])
+            self._frame_theme = state["frame_theme"]
+            self._sync_active_sticker()
+
+            for attr, sc in self._adjust_sliders.items():
+                sc.set_value(getattr(self, attr))
+            for mode, btn in getattr(self, "_filter_btns", {}).items():
+                btn.set_active(mode == self._filter_mode)
+            target_frame = self._frame_theme or "none"
+            for theme_key, btn in getattr(self, "_frame_btns", {}).items():
+                btn.set_active(theme_key == target_frame)
+        finally:
+            self._restoring = False
+
     def _snapshot_state(self) -> None:
-        """Save current working image to undo stack (call after each edit)."""
-        # Clear redo stack when new edit is made
+        """Save full editor state to the undo stack and clear redo."""
+        if self._restoring:
+            return
         self._history_redo.clear()
-        # Save current state to undo stack
-        self._history_undo.append(self._working.copy())
-        # Limit history size to prevent memory bloat
+        self._history_undo.append(self._capture_state())
         if len(self._history_undo) > self._history_max_steps:
             self._history_undo.pop(0)
+        self._emit_history_changed()
 
     def can_undo(self) -> bool:
         """Check if undo is available."""
@@ -1638,23 +1318,21 @@ class EditorView(Gtk.Box):
         """Undo last edit."""
         if not self.can_undo():
             return
-        # Save current state to redo stack
-        self._history_redo.append(self._working.copy())
-        # Restore previous state
-        self._working = self._history_undo.pop()
-        # Trigger preview update
+        self._history_redo.append(self._capture_state())
+        self._restore_state(self._history_undo.pop())
         self._schedule_update()
+        self._draw_area.queue_draw()
+        self._emit_history_changed()
 
     def redo(self) -> None:
         """Redo last undone edit."""
         if not self.can_redo():
             return
-        # Save current state to undo stack
-        self._history_undo.append(self._working.copy())
-        # Restore next state
-        self._working = self._history_redo.pop()
-        # Trigger preview update
+        self._history_undo.append(self._capture_state())
+        self._restore_state(self._history_redo.pop())
         self._schedule_update()
+        self._draw_area.queue_draw()
+        self._emit_history_changed()
 
     # ------------------------------------------------------------------
     # Save
@@ -1687,7 +1365,7 @@ class EditorView(Gtk.Box):
         Upload edited local image back to Nextcloud at the original path.
         Used for cloud-sync workflow.
         """
-        from .nextcloud import dav_path_from_nc, NC_PATH_PREFIX
+        from ..nextcloud import dav_path_from_nc, NC_PATH_PREFIX
         
         # Extract DAV path from the original Nextcloud item
         if not self._item.path.startswith(NC_PATH_PREFIX):
@@ -1708,7 +1386,3 @@ class EditorView(Gtk.Box):
         except Exception as exc:
             LOGGER.exception("Upload to Nextcloud failed: %s", exc)
             return False
-
-
-# ---------------------------------------------------------------------------
-# Settings window

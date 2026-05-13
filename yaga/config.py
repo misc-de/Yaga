@@ -5,7 +5,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
 
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "yaga"
@@ -41,6 +40,15 @@ class Settings:
     # string falls back to Path(path).name. Stored as a parallel list (not as
     # tuples) to keep settings.json human-editable and JSON-serialisable.
     extra_location_names: list[str] = field(default_factory=list)
+    # "Do not inherit" flag per extra location, index-aligned. When True, any
+    # *other* category whose root is a parent of this folder will not include
+    # its content during scans — useful when a subfolder is exposed as its
+    # own category and shouldn't be listed twice.
+    extra_location_no_inherit: list[bool] = field(default_factory=list)
+    # Media-type filter per extra location, index-aligned. Allowed values:
+    # "both" (default), "images", "videos". Drives which rows show up when
+    # the user opens this folder in the gallery.
+    extra_location_media_filter: list[str] = field(default_factory=list)
     sort_mode: str = "newest"
     sort_modes: dict = field(default_factory=dict)
     theme: str = "system"
@@ -48,6 +56,33 @@ class Settings:
     external_video_player: str = ""
     grid_columns: int = 4
     last_category: str = ""
+    # Where to place the category nav bar relative to the gallery content.
+    # Valid values: "top" (default, preserves legacy layout), "bottom", "left", "right".
+    nav_position: str = "top"
+    # Which side the camera record button (and any other thumb-reachable
+    # camera controls) should sit on. "right" or "left".
+    handedness: str = "right"
+    # Camera capture settings — persisted across sessions.
+    # jpeg quality (0-100) used by the gst-jpegenc element when we
+    # encode in-pipeline, and by Pillow when we re-encode after a
+    # post-capture downscale.
+    camera_jpeg_quality: int = 92
+    # Photo target size (w, h). null/None = save at HAL-native resolution.
+    # Stored as a list because tuples don't survive JSON round-trips.
+    camera_image_resolution: list | None = None
+    # Video record bitrate (kbps) — applied when the record path lands.
+    camera_video_bitrate_kbps: int = 4000
+    # Camera geotagging: user intent. Boolean on/off. When on, the camera
+    # tries to acquire a GPS fix via GeoClue; if unavailable, silently
+    # no-op (no error toast).
+    camera_geo_enabled: bool = False
+
+    # Flash / torch toggle. Single boolean covers both:
+    #   - photo mode → flash-mode=ON (fires once at capture)
+    #   - video mode → direct sysfs torch (continuous light while active)
+    # Only meaningful on Halium / gst-droid devices; v4l2 cameras
+    # silently ignore it.
+    camera_flash_enabled: bool = False
 
     # User-defined ordering of the four built-in media folders. Items not in
     # the list (e.g. legacy upgrades that didn't write the field) fall back to
@@ -55,6 +90,16 @@ class Settings:
     media_folder_order: list = field(default_factory=lambda: [
         "pictures", "photos", "videos", "screenshots",
     ])
+
+    # The "Overview" category is a virtual aggregator across every other
+    # local category. It can be hidden from the gallery navigation but
+    # never deleted — pictures_dir is preserved purely for legacy load()
+    # compatibility and is no longer scanned.
+    pictures_hidden: bool = False
+    # Media-type filter for Overview. Defaults to "images" so the historic
+    # Pictures view (images-only) keeps its semantics on upgrade. Allowed:
+    # "both", "images", "videos" — same vocabulary as extras.
+    pictures_media_filter: str = "images"
 
     # Disk cache budget for thumbnails + downloaded NC originals (MB).
     # 0 means "unlimited"; any positive value triggers LRU eviction.
@@ -89,12 +134,49 @@ class Settings:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         settings = cls(**{k: v for k, v in data.items() if k in known})
         settings.grid_columns = min(max(int(settings.grid_columns), 2), 10)
+        # Clamp legacy / hand-edited values to the four supported positions so a
+        # typo in settings.json doesn't crash the layout logic in _build_ui.
+        if settings.nav_position not in ("top", "bottom", "left", "right"):
+            settings.nav_position = "top"
+        if settings.handedness not in ("left", "right", "neutral"):
+            settings.handedness = "right"
+        # Clamp / sanitise camera fields against hand-edited values.
+        settings.camera_jpeg_quality = min(
+            max(int(settings.camera_jpeg_quality), 1), 100
+        )
+        settings.camera_video_bitrate_kbps = max(
+            int(settings.camera_video_bitrate_kbps), 200
+        )
+        if settings.camera_image_resolution is not None:
+            try:
+                w, h = (
+                    int(settings.camera_image_resolution[0]),
+                    int(settings.camera_image_resolution[1]),
+                )
+                if w <= 0 or h <= 0:
+                    raise ValueError
+                settings.camera_image_resolution = [w, h]
+            except Exception:
+                settings.camera_image_resolution = None
         return settings
 
     def save(self) -> None:
+        # Atomic write: serialise to a sibling tmp file, fsync, rename
+        # into place. Without this, a crash mid-write produces a
+        # truncated JSON file that load() can't parse — and load()
+        # silently falls back to defaults, losing every user setting.
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         path = CONFIG_DIR / "settings.json"
-        path.write_text(json.dumps(self.__dict__, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        data = json.dumps(self.__dict__, indent=2, ensure_ascii=False)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
 
     def get_sort_mode(self, category: str, folder: str | None = None) -> str:
         default = "folder" if category == "nextcloud" else self.sort_mode
@@ -106,10 +188,13 @@ class Settings:
 
     def categories(self) -> list[tuple[str, str, str]]:
         cat_map: dict[str, tuple[str, str]] = {}
-        # Built-ins are visible only when their path is non-empty — clearing
-        # the path is how the user "deletes" a built-in folder.
-        if self.pictures_dir:
-            cat_map["pictures"] = ("Overview", self.pictures_dir)
+        # Overview is a virtual aggregator. Its path slot carries the legacy
+        # pictures_dir value so existing 3-tuple consumers stay happy, but the
+        # DB query for category="pictures" unions the other categories — the
+        # path itself is never scanned. The user can hide Overview but not
+        # remove it; clearing pictures_dir does not delete it anymore.
+        if not self.pictures_hidden:
+            cat_map["pictures"] = ("Overview", self.pictures_dir or "(overview)")
         if self.photos_dir:
             cat_map["photos"] = ("Photos", self.photos_dir)
         if self.videos_dir:
@@ -140,6 +225,41 @@ class Settings:
             cats.append((key, label, path))
         return cats
 
+    def media_filter_for(self, category: str) -> str | None:
+        """Resolve the per-folder media-type filter for *category*. Returns
+        one of "both"/"images"/"videos" for Overview and extra locations
+        that have it explicitly set, or None to mean "use the DB's
+        category default" (built-ins keep their historic image/video
+        split)."""
+        if category == "pictures":
+            val = self.pictures_media_filter
+            return val if val in ("both", "images", "videos") else "images"
+        if not category.startswith("location:"):
+            return None
+        try:
+            idx = int(category.split(":", 1)[1])
+        except ValueError:
+            return None
+        if idx < 0 or idx >= len(self.extra_location_media_filter):
+            return None
+        val = self.extra_location_media_filter[idx]
+        if val in ("both", "images", "videos"):
+            return val
+        return None
+
+    def excluded_subtrees(self) -> list[str]:
+        """Absolute paths of extra locations flagged "do not inherit". The
+        scanner subtracts these from any parent root's recursive walk so a
+        single folder is never listed under both its own category and a
+        containing one."""
+        out: list[str] = []
+        for i, p in enumerate(self.extra_locations):
+            if i >= len(self.extra_location_no_inherit):
+                break
+            if self.extra_location_no_inherit[i] and p:
+                out.append(str(Path(p).expanduser()))
+        return out
+
     # ------------------------------------------------------------------
     # Nextcloud helpers
     # ------------------------------------------------------------------
@@ -154,65 +274,11 @@ class Settings:
             url = "https://" + url
         return url
 
-    def nextcloud_webdav_url(self, app_password: str) -> str:
-        """davs:// URL used with gio mount (always HTTPS unless user forced http://)."""
-        if not self.nextcloud_url or not self.nextcloud_user:
-            return ""
-        base = self._normalize_url(self.nextcloud_url)
-        host = re.sub(r"^https?://", "", base).split("/")[0]
-        # Only use plain dav:// when the user explicitly typed http://
-        scheme = "dav" if self.nextcloud_url.strip().startswith("http://") else "davs"
-        pwd = quote(app_password, safe="")
-        return (
-            f"{scheme}://{self.nextcloud_user}:{pwd}@{host}"
-            f"/remote.php/dav/files/{self.nextcloud_user}/"
-        )
-
-    def nextcloud_local_path(self) -> str:
-        """Return the GVFS path for the configured Photos folder, or ''."""
-        if not self.nextcloud_url or not self.nextcloud_user:
-            return ""
-        gvfs = Path(f"/run/user/{os.getuid()}/gvfs")
-        if not gvfs.exists():
-            return ""
-        host = re.sub(r"^https?://", "", self.nextcloud_url.strip()).split("/")[0]
-        for entry in sorted(gvfs.iterdir()):
-            n = entry.name
-            if "dav" not in n:
-                continue
-            if host not in n and self.nextcloud_user not in n:
-                continue
-            sub = entry / "files" / self.nextcloud_user / self.nextcloud_photos_path
-            try:
-                exists = sub.exists()
-            except OSError:
-                # PermissionError from GVFS FUSE means the mount IS there —
-                # os.stat raises EACCES instead of ENOENT for an existing FUSE path
-                exists = True
-            if exists:
-                return str(sub)
-        return ""
-
-    def nextcloud_available_folders(self) -> list[str]:
-        """Return top-level folder names inside the Nextcloud mount (for error feedback)."""
-        if not self.nextcloud_url or not self.nextcloud_user:
-            return []
-        gvfs = Path(f"/run/user/{os.getuid()}/gvfs")
-        if not gvfs.exists():
-            return []
-        host = re.sub(r"^https?://", "", self.nextcloud_url.strip()).split("/")[0]
-        for entry in sorted(gvfs.iterdir()):
-            n = entry.name
-            if "dav" not in n:
-                continue
-            if host not in n and self.nextcloud_user not in n:
-                continue
-            files_root = entry / "files" / self.nextcloud_user
-            try:
-                return sorted(p.name for p in files_root.iterdir() if p.is_dir())
-            except OSError:
-                return []
-        return []
+    # The GVFS-era helpers (nextcloud_webdav_url, nextcloud_local_path,
+    # nextcloud_available_folders) used to live here. They were leftovers
+    # from a discontinued gio-mount path; the direct WebDAV client
+    # (NextcloudClient in nextcloud.py) replaced all of them. Removed so a
+    # future caller can't accidentally bring them back into use.
 
     # ------------------------------------------------------------------
     # App-password keyring helpers (libsecret, falls back to nothing)
@@ -243,11 +309,57 @@ class Settings:
                 return True
         except Exception:
             pass
-        # Fallback: plain file with restricted permissions
+        # Fallback: plain file with restricted permissions.
+        # mkdir(mode=…) only applies on first create; for pre-existing 0755
+        # dirs we follow up with an explicit chmod so the secret's parent
+        # directory matches the secret's own 0600 file mode.
+        # Atomic write (tmp + os.replace) keeps a crash mid-write from
+        # truncating an existing password file to zero bytes.
         try:
-            self._CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-            self._CRED_FILE.write_text(password, encoding="utf-8")
-            self._CRED_FILE.chmod(0o600)
+            parent = self._CRED_FILE.parent
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                parent.chmod(0o700)
+            except OSError:
+                pass
+            tmp = self._CRED_FILE.with_suffix(".tmp")
+            # Create the tmp file 0600 BEFORE writing the password.
+            # path.write_text() creates the file with umask-default
+            # permissions (usually 0644) and only chmod-s it after the
+            # write — for that window the password is world-readable on
+            # multi-user systems. os.open with O_CREAT|O_EXCL|0o600
+            # establishes the right mode atomically before any bytes
+            # land.
+            try:
+                fd = os.open(
+                    tmp,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC,
+                    0o600,
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(password)
+                        fh.flush()
+                        try:
+                            os.fsync(fh.fileno())
+                        except OSError:
+                            pass
+                except Exception:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                os.replace(tmp, self._CRED_FILE)
+            finally:
+                # If os.replace already moved tmp into place this is a
+                # no-op; if anything else failed we don't want a partial
+                # password sitting around in cleartext.
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
             return True
         except Exception:
             return False

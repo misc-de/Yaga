@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
+import sys
 import threading
 from pathlib import Path
 
@@ -11,17 +14,27 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
-from .config import Settings
+from .camera_torch import TORCH_SYSFS_PATHS
+from .config import CACHE_DIR, CONFIG_DIR, DATA_DIR, DB_PATH, DEBUG_LOG_PATH, Settings
 
 LOGGER = logging.getLogger(__name__)
 
 class SettingsWindow(Adw.PreferencesWindow):
-    def __init__(self, parent: GalleryWindow) -> None:
+    def __init__(self, parent: GalleryWindow, initial_page: str | None = None) -> None:
         super().__init__(transient_for=parent, modal=True, title=parent._("Settings"))
         self.set_search_enabled(False)
         self.parent_window = parent
         self.settings = Settings(**parent.settings.__dict__)
         self._build()
+        if initial_page:
+            # Switch to the named page (e.g. after a nav-position change
+            # recreates the window and reopens settings to where the user was).
+            # Falls back to the default first page if the name doesn't exist —
+            # set_visible_page_name is forgiving with unknown names.
+            try:
+                self.set_visible_page_name(initial_page)
+            except Exception:
+                pass
         # Suppress GTK's default "focus the first focusable widget" so opening
         # settings doesn't pop up the on-screen keyboard on a SpinRow / Entry.
         GLib.idle_add(lambda: (self.set_focus(None), GLib.SOURCE_REMOVE)[1])
@@ -31,6 +44,9 @@ class SettingsWindow(Adw.PreferencesWindow):
 
     def _build(self) -> None:
         media = Adw.PreferencesPage(title=self._("Folders"), icon_name="folder-pictures-symbolic")
+        # Stable name (independent of the translated title) so callers can
+        # jump to a specific page via set_visible_page_name().
+        media.set_name("folders")
         self.add(media)
         group = Adw.PreferencesGroup(title=self._("Folders"))
         media.add(group)
@@ -65,6 +81,7 @@ class SettingsWindow(Adw.PreferencesWindow):
         group.add(add_btn)
 
         app = Adw.PreferencesPage(title=self._("Appearance"), icon_name="preferences-desktop-appearance-symbolic")
+        app.set_name("appearance")
         self.add(app)
         theme_group = Adw.PreferencesGroup(title=self._("Appearance"))
         app.add(theme_group)
@@ -78,6 +95,37 @@ class SettingsWindow(Adw.PreferencesWindow):
         columns.set_value(self.settings.grid_columns)
         columns.connect("notify::value", self._columns_changed)
         grid_group.add(columns)
+
+        nav_group = Adw.PreferencesGroup(
+            title=self._("Navigation"),
+            description=self._("Where the category bar is shown around the gallery."),
+        )
+        app.add(nav_group)
+        nav_group.add(self._combo_row(
+            "nav_position", "Position",
+            [
+                ("top",    "Top"),
+                ("right",  "Right"),
+                ("bottom", "Bottom"),
+                ("left",   "Left"),
+            ],
+        ))
+
+        handedness_group = Adw.PreferencesGroup(
+            title=self._("Handedness"),
+            description=self._(
+                "Which side thumb-reachable camera controls sit on."
+            ),
+        )
+        app.add(handedness_group)
+        handedness_group.add(self._combo_row(
+            "handedness", "Camera buttons",
+            [
+                ("right",   "Right-handed"),
+                ("left",    "Left-handed"),
+                ("neutral", "Neutral (centred)"),
+            ],
+        ))
 
         video_group = Adw.PreferencesGroup(
             title=self._("Video"),
@@ -114,6 +162,136 @@ class SettingsWindow(Adw.PreferencesWindow):
 
         self._build_people_page()
         self._build_nextcloud_page()
+        self._build_diagnostics_page()
+
+    def _build_diagnostics_page(self) -> None:
+        page = Adw.PreferencesPage(
+            title=self._("Diagnostics"),
+            icon_name="dialog-information-symbolic",
+        )
+        page.set_name("diagnostics")
+        self.add(page)
+
+        group = Adw.PreferencesGroup(
+            title=self._("Diagnostics"),
+            description=self._(
+                "Copy this when reporting camera, Nextcloud, or media-scan issues."
+            ),
+        )
+        page.add(group)
+
+        copy_row = Adw.ActionRow(
+            title=self._("Diagnostic report"),
+            subtitle=self._("Includes paths, runtime versions, camera plugins, and status flags."),
+        )
+        copy_btn = Gtk.Button(label=self._("Copy"))
+        copy_btn.set_valign(Gtk.Align.CENTER)
+        copy_btn.connect("clicked", self._copy_diagnostics)
+        copy_row.add_suffix(copy_btn)
+        group.add(copy_row)
+
+        self._diagnostics_view = Gtk.TextView()
+        self._diagnostics_view.set_editable(False)
+        self._diagnostics_view.set_cursor_visible(False)
+        self._diagnostics_view.set_monospace(True)
+        self._diagnostics_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._diagnostics_view.set_top_margin(10)
+        self._diagnostics_view.set_bottom_margin(10)
+        self._diagnostics_view.set_left_margin(10)
+        self._diagnostics_view.set_right_margin(10)
+        self._diagnostics_view.get_buffer().set_text(self._diagnostics_text())
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_min_content_height(260)
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(self._diagnostics_view)
+        group.add(scroller)
+
+    def _copy_diagnostics(self, btn: Gtk.Button) -> None:
+        text = self._diagnostics_text()
+        self._diagnostics_view.get_buffer().set_text(text)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            display.get_clipboard().set(text)
+        btn.set_label(self._("Copied"))
+        GLib.timeout_add_seconds(2, lambda: (btn.set_label(self._("Copy")), False)[1])
+
+    def _diagnostics_text(self) -> str:
+        gst_info = self._gst_diagnostics()
+        s = self.settings
+        parent = self.parent_window
+        lines = [
+            "Yaga diagnostics",
+            "================",
+            f"Python: {sys.version.split()[0]}",
+            f"Platform: {platform.platform()}",
+            f"Executable: {sys.executable}",
+            f"PID: {os.getpid()}",
+            "",
+            "Paths",
+            "-----",
+            f"Config: {CONFIG_DIR}",
+            f"Cache: {CACHE_DIR}",
+            f"Data: {DATA_DIR}",
+            f"Database: {DB_PATH} ({'exists' if DB_PATH.exists() else 'missing'})",
+            f"Debug log: {DEBUG_LOG_PATH} ({'exists' if DEBUG_LOG_PATH.exists() else 'missing'})",
+            "",
+            "Media folders",
+            "-------------",
+            f"Overview: hidden={s.pictures_hidden}, filter={s.pictures_media_filter}",
+            f"Photos: {s.photos_dir}",
+            f"Pictures legacy path: {s.pictures_dir}",
+            f"Videos: {s.videos_dir}",
+            f"Screenshots: {s.screenshots_dir}",
+            f"Extra locations: {len(s.extra_locations)}",
+            "",
+            "Nextcloud",
+            "---------",
+            f"Enabled: {s.nextcloud_enabled}",
+            f"Session active: {getattr(parent, '_nc_session_active', False)}",
+            f"URL set: {bool(s.nextcloud_url)}",
+            f"User set: {bool(s.nextcloud_user)}",
+            f"Photos path: {s.nextcloud_photos_path}",
+            f"Thumbnail-only scan: {s.nextcloud_thumbnail_only}",
+            "",
+            "Camera settings",
+            "---------------",
+            f"Handedness: {s.handedness}",
+            f"JPEG quality: {s.camera_jpeg_quality}",
+            f"Image resolution: {s.camera_image_resolution or 'native/default'}",
+            f"Video quality preset: {s.camera_video_bitrate_kbps} kbps",
+            f"Geotagging enabled: {s.camera_geo_enabled}",
+            f"Flash/video-light enabled: {s.camera_flash_enabled}",
+            "",
+            "GStreamer",
+            "---------",
+            *gst_info,
+            "",
+            "Torch sysfs",
+            "-----------",
+        ]
+        for path in TORCH_SYSFS_PATHS:
+            p = Path(path)
+            writable = os.access(path, os.W_OK)
+            lines.append(f"{path}: {'exists' if p.exists() else 'missing'}, writable={writable}")
+        return "\n".join(lines) + "\n"
+
+    def _gst_diagnostics(self) -> list[str]:
+        try:
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst  # type: ignore
+            Gst.init(None)
+        except Exception as exc:
+            return [f"Unavailable: {exc}"]
+        factories = (
+            "droidcamsrc", "gtk4paintablesink", "v4l2src", "pipewiresrc",
+            "autovideosrc", "appsink", "jpegenc", "jpegdec", "matroskamux",
+            "filesink", "zxing",
+        )
+        out = [f"Version: {Gst.version_string()}"]
+        for name in factories:
+            out.append(f"{name}: {bool(Gst.ElementFactory.find(name))}")
+        return out
 
     def _build_people_page(self) -> None:
         page = Adw.PreferencesPage(
@@ -245,6 +423,7 @@ class SettingsWindow(Adw.PreferencesWindow):
 
     def _build_nextcloud_page(self) -> None:
         page = Adw.PreferencesPage(title="Nextcloud", icon_name="folder-remote-symbolic")
+        page.set_name("nextcloud")
         self.add(page)
 
         # Track whether the user explicitly chose "manual" in the setup dialog —
@@ -341,8 +520,8 @@ class SettingsWindow(Adw.PreferencesWindow):
         self._nc_perf_group.add(thumb_row)
 
         merge_row = Adw.SwitchRow(
-            title=self._("Show in Pictures"),
-            subtitle=self._("Merge Nextcloud items into the Pictures view (thumbnails load on demand)"),
+            title=self._("Show in Overview"),
+            subtitle=self._("Merge Nextcloud items into the Overview (thumbnails load on demand)"),
         )
         merge_row.set_active(self.settings.nextcloud_show_in_pictures)
         merge_row.connect("notify::active", self._nc_show_in_pictures_changed)
@@ -493,8 +672,6 @@ class SettingsWindow(Adw.PreferencesWindow):
         url  = self._nc_url_row.get_text().strip()
         user = self._nc_user_row.get_text().strip()
         pwd  = self._nc_pass_row.get_text()
-        # Read the Photos path from settings (edited via the media-folders page).
-        path = (self.settings.nextcloud_photos_path or "").strip() or "Photos"
 
         if not url or not user or not pwd:
             self._nc_set_status(self._("Please fill in all fields."), ok=False)
@@ -502,6 +679,46 @@ class SettingsWindow(Adw.PreferencesWindow):
 
         url = self.settings._normalize_url(url)
         self._nc_url_row.set_text(url)
+
+        # Cleartext-only connection: _normalize_url defaults to https://, so
+        # http:// here means the user explicitly typed it. Warn + require
+        # confirmation before sending the password in the clear.
+        if url.startswith("http://"):
+            self._nc_warn_cleartext_then_connect(url, user, pwd)
+            return
+
+        self._nc_proceed_connect(url, user, pwd)
+
+    def _nc_warn_cleartext_then_connect(self, url: str, user: str, pwd: str) -> None:
+        dialog = Adw.AlertDialog(
+            heading=self._("Unencrypted connection"),
+            body=self._(
+                "The server URL starts with http:// — your password and "
+                "photos will be transmitted unencrypted. Anyone on the same "
+                "network can read them. Use https:// unless you have a "
+                "specific reason not to."
+            ),
+        )
+        dialog.add_response("cancel", self._("Cancel"))
+        dialog.add_response("connect_anyway", self._("Connect anyway"))
+        dialog.set_response_appearance(
+            "connect_anyway", Adw.ResponseAppearance.DESTRUCTIVE,
+        )
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response: str) -> None:
+            if response == "connect_anyway":
+                self._nc_proceed_connect(url, user, pwd)
+            else:
+                self._nc_set_status(self._("Cancelled"), ok=False)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _nc_proceed_connect(self, url: str, user: str, pwd: str) -> None:
+        # Read the Photos path from settings (edited via the media-folders page).
+        path = (self.settings.nextcloud_photos_path or "").strip() or "Photos"
 
         account_changed = (url != self.settings.nextcloud_url
                            or user != self.settings.nextcloud_user)
@@ -683,6 +900,18 @@ class SettingsWindow(Adw.PreferencesWindow):
             base = self._media_folder_specs[key]
             attr = base["attr"]
             value = getattr(self.settings, attr) or ""
+            if key == "pictures":
+                # Overview is a virtual aggregator — always shown in the
+                # listbox so the user can toggle its visibility. It can't
+                # be removed and has no path picker.
+                return {
+                    "key":   key,
+                    "title": base["title"],
+                    "path":  self._("All other folders combined"),
+                    "kind":  "overview",
+                    "attr":  attr,
+                    "removable": False,
+                }
             if not value and base["kind"] != "nextcloud":
                 return None
             if base["kind"] == "nextcloud" and not self.settings.nextcloud_enabled:
@@ -720,7 +949,10 @@ class SettingsWindow(Adw.PreferencesWindow):
 
     def _available_media_keys(self) -> list[str]:
         keys: list[str] = []
-        for k in ("pictures", "photos", "videos", "screenshots"):
+        # Overview is virtual — listed regardless of any path setting so the
+        # user can always toggle its visibility from the row.
+        keys.append("pictures")
+        for k in ("photos", "videos", "screenshots"):
             if getattr(self.settings, self._media_folder_specs[k]["attr"]):
                 keys.append(k)
         if self.settings.nextcloud_enabled:
@@ -787,33 +1019,57 @@ class SettingsWindow(Adw.PreferencesWindow):
         text_box.append(path_lbl)
         box.append(text_box)
 
-        # Trash icon — left of the chooser/edit button. Hidden for Nextcloud,
-        # which is structurally not removable in this UI.
-        if spec["removable"]:
-            trash = Gtk.Button.new_from_icon_name("user-trash-symbolic")
-            trash.set_tooltip_text(self._("Remove"))
-            trash.add_css_class("flat")
-            trash.set_valign(Gtk.Align.CENTER)
-            trash.connect("clicked", self._confirm_remove_media, key)
-            box.append(trash)
+        # Overview takes a visibility toggle in place of the trash + chooser
+        # combo: it is a virtual aggregator that the user can hide but never
+        # remove, and there's no underlying path to pick.
+        if spec["kind"] == "overview":
+            hidden = bool(self.settings.pictures_hidden)
+            edit = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+            edit.set_tooltip_text(self._("Edit"))
+            edit.add_css_class("flat")
+            edit.set_valign(Gtk.Align.CENTER)
+            edit.connect("clicked", self._edit_overview)
+            box.append(edit)
+            toggle = Gtk.Button.new_from_icon_name(
+                "view-reveal-symbolic" if hidden else "view-conceal-symbolic"
+            )
+            toggle.set_tooltip_text(
+                self._("Show") if hidden else self._("Hide")
+            )
+            toggle.add_css_class("flat")
+            toggle.set_valign(Gtk.Align.CENTER)
+            toggle.connect("clicked", self._toggle_pictures_hidden)
+            if hidden:
+                title_lbl.add_css_class("dim-label")
+            box.append(toggle)
+        else:
+            # Trash icon — left of the chooser/edit button. Hidden for Nextcloud,
+            # which is structurally not removable in this UI.
+            if spec["removable"]:
+                trash = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+                trash.set_tooltip_text(self._("Remove"))
+                trash.add_css_class("flat")
+                trash.set_valign(Gtk.Align.CENTER)
+                trash.connect("clicked", self._confirm_remove_media, key)
+                box.append(trash)
 
-        if spec["kind"] == "local":
-            choose = Gtk.Button.new_from_icon_name("folder-open-symbolic")
-            choose.set_tooltip_text(self._("Choose folder"))
-            choose.connect("clicked", self._choose_folder_for_key, spec["attr"], path_lbl)
-        elif spec["kind"] == "extra":
-            # Pencil — opens a dialog with both Name and Path fields, since the
-            # custom name is what shows up in the gallery navigation.
-            choose = Gtk.Button.new_from_icon_name("document-edit-symbolic")
-            choose.set_tooltip_text(self._("Edit"))
-            choose.connect("clicked", self._edit_extra_location, spec["extra_idx"], title_lbl, path_lbl)
-        else:  # nextcloud
-            choose = Gtk.Button.new_from_icon_name("document-edit-symbolic")
-            choose.set_tooltip_text(self._("Edit"))
-            choose.connect("clicked", self._edit_nc_path, path_lbl)
-        choose.add_css_class("flat")
-        choose.set_valign(Gtk.Align.CENTER)
-        box.append(choose)
+            if spec["kind"] == "local":
+                choose = Gtk.Button.new_from_icon_name("folder-open-symbolic")
+                choose.set_tooltip_text(self._("Choose folder"))
+                choose.connect("clicked", self._choose_folder_for_key, spec["attr"], path_lbl)
+            elif spec["kind"] == "extra":
+                # Pencil — opens a dialog with both Name and Path fields, since the
+                # custom name is what shows up in the gallery navigation.
+                choose = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+                choose.set_tooltip_text(self._("Edit"))
+                choose.connect("clicked", self._edit_extra_location, spec["extra_idx"], title_lbl, path_lbl)
+            else:  # nextcloud
+                choose = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+                choose.set_tooltip_text(self._("Edit"))
+                choose.connect("clicked", self._edit_nc_path, path_lbl)
+            choose.add_css_class("flat")
+            choose.set_valign(Gtk.Align.CENTER)
+            box.append(choose)
 
         row.set_child(box)
 
@@ -1035,13 +1291,15 @@ class SettingsWindow(Adw.PreferencesWindow):
             path = file.get_path()
             if not path or path in self.settings.extra_locations:
                 return
-            # Append the new location to extra_locations and to the order list,
-            # so the new entry shows up at the bottom of the listbox.
+            # self.settings was built via `Settings(**parent.settings.__dict__)`,
+            # so its list attributes are *the same* objects as parent's — one
+            # append per list reaches both. A second append on the parent ref
+            # was the cause of every new folder showing up twice.
             self.settings.extra_locations.append(path)
             self.settings.extra_location_names.append("")
+            self.settings.extra_location_no_inherit.append(False)
+            self.settings.extra_location_media_filter.append("both")
             new_idx = len(self.settings.extra_locations) - 1
-            self.parent_window.settings.extra_locations.append(path)
-            self.parent_window.settings.extra_location_names.append("")
             order = list(self.settings.media_folder_order or [])
             order.append(f"location:{new_idx}")
             self.settings.media_folder_order = order
@@ -1052,6 +1310,77 @@ class SettingsWindow(Adw.PreferencesWindow):
             self.parent_window.refresh(scan=True)
         finally:
             chooser.destroy()
+
+    def _edit_overview(self, _btn: Gtk.Button) -> None:
+        """Overview has no path or name to edit — the only editable knob
+        is the media-type filter (Images / Videos / Both). Mirrors the
+        extras edit dialog so the UX stays consistent."""
+        current = self.settings.pictures_media_filter
+        if current not in ("both", "images", "videos"):
+            current = "images"
+
+        dialog = Adw.AlertDialog(
+            heading=self._("Edit folder"),
+            body=self._("Overview shows the combined content of every other folder."),
+        )
+
+        filter_values = ["both", "images", "videos"]
+        filter_labels = [self._("Both"), self._("Images only"), self._("Videos only")]
+        filter_store = Gtk.StringList()
+        for lbl in filter_labels:
+            filter_store.append(lbl)
+        filter_row = Adw.ComboRow(
+            title=self._("Show"),
+            subtitle=self._("Which media types appear when this folder is opened."),
+            model=filter_store,
+            selected=filter_values.index(current),
+        )
+
+        group = Adw.PreferencesGroup()
+        group.add(filter_row)
+        dialog.set_extra_child(group)
+
+        dialog.add_response("cancel", self._("Cancel"))
+        dialog.add_response("save", self._("Save"))
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+
+        def _done(_d, response):
+            if response != "save":
+                return
+            new_val = filter_values[filter_row.get_selected()]
+            self.settings.pictures_media_filter = new_val
+            self.parent_window.settings.pictures_media_filter = new_val
+            self.parent_window.settings.save()
+            # Re-render only if Overview is currently visible — otherwise
+            # the change applies the next time the user shows it.
+            if self.parent_window.category == "pictures":
+                self.parent_window.refresh(scan=False)
+
+        dialog.connect("response", _done)
+        dialog.present(self)
+
+    def _toggle_pictures_hidden(self, _btn: Gtk.Button) -> None:
+        new_value = not bool(self.settings.pictures_hidden)
+        self.settings.pictures_hidden = new_value
+        self.parent_window.settings.pictures_hidden = new_value
+        self.parent_window.settings.save()
+        self._populate_media_listbox()
+        # _rebuild_categories drops the Overview button when hidden. If
+        # Overview was the active tab, activate the first remaining
+        # button so the gallery doesn't stay pointed at a vanished tab.
+        self.parent_window._rebuild_categories()
+        if new_value and self.parent_window.category == "pictures":
+            remaining = list(self.parent_window.category_buttons.items())
+            if remaining:
+                next_cat, next_btn = remaining[0]
+                # set_active(True) fires _on_category_toggled, which handles
+                # the self.category update, last_category persistence and
+                # the re-render in one path.
+                next_btn.set_active(True)
+                return
+        self.parent_window.refresh(scan=False)
 
     def _confirm_remove_media(self, _btn: Gtk.Button, key: str) -> None:
         spec = self._row_spec(key)
@@ -1098,11 +1427,15 @@ class SettingsWindow(Adw.PreferencesWindow):
         new_extras.pop(idx)
         self.settings.extra_locations = new_extras
         self.parent_window.settings.extra_locations = list(new_extras)
-        # Names list runs in lock-step with the paths.
+        # Names + no-inherit lists run in lock-step with the paths. They are
+        # shared with parent.settings (shallow-copy in __init__), so one
+        # pop per list is enough — popping twice removed the next entry too.
         if idx < len(self.settings.extra_location_names):
             self.settings.extra_location_names.pop(idx)
-        if idx < len(self.parent_window.settings.extra_location_names):
-            self.parent_window.settings.extra_location_names.pop(idx)
+        if idx < len(self.settings.extra_location_no_inherit):
+            self.settings.extra_location_no_inherit.pop(idx)
+        if idx < len(self.settings.extra_location_media_filter):
+            self.settings.extra_location_media_filter.pop(idx)
 
         renumbered: list[str] = []
         for k in (self.settings.media_folder_order or []):
@@ -1135,6 +1468,18 @@ class SettingsWindow(Adw.PreferencesWindow):
             if idx < len(self.settings.extra_location_names)
             else ""
         )
+        current_no_inherit = (
+            self.settings.extra_location_no_inherit[idx]
+            if idx < len(self.settings.extra_location_no_inherit)
+            else False
+        )
+        current_media_filter = (
+            self.settings.extra_location_media_filter[idx]
+            if idx < len(self.settings.extra_location_media_filter)
+            else "both"
+        )
+        if current_media_filter not in ("both", "images", "videos"):
+            current_media_filter = "both"
         # Pre-fill with whatever is currently shown as the entry label so the
         # user starts editing from the value they actually see.
         display_name = custom_name or Path(current_path).name or current_path
@@ -1182,9 +1527,34 @@ class SettingsWindow(Adw.PreferencesWindow):
         browse.connect("clicked", _open_picker)
         path_row.add_suffix(browse)
 
+        inherit_row = Adw.SwitchRow(
+            title=self._("Don't inherit"),
+            subtitle=self._(
+                "Parent folders won't include this folder's content during scans."
+            ),
+        )
+        inherit_row.set_active(bool(current_no_inherit))
+
+        # Media-type filter: the order of `filter_values` must stay in lock-step
+        # with the labels appended to `filter_store` so the resolved selection
+        # maps back to the right enum value.
+        filter_values = ["both", "images", "videos"]
+        filter_labels = [self._("Both"), self._("Images only"), self._("Videos only")]
+        filter_store = Gtk.StringList()
+        for lbl in filter_labels:
+            filter_store.append(lbl)
+        filter_row = Adw.ComboRow(
+            title=self._("Show"),
+            subtitle=self._("Which media types appear when this folder is opened."),
+            model=filter_store,
+            selected=filter_values.index(current_media_filter),
+        )
+
         group = Adw.PreferencesGroup()
         group.add(name_row)
         group.add(path_row)
+        group.add(inherit_row)
+        group.add(filter_row)
         dialog.set_extra_child(group)
 
         dialog.add_response("cancel", self._("Cancel"))
@@ -1198,16 +1568,20 @@ class SettingsWindow(Adw.PreferencesWindow):
                 return
             new_name = name_row.get_text().strip()
             new_path = path_row.get_text().strip() or current_path
-            # Apply
+            new_no_inherit = bool(inherit_row.get_active())
+            new_media_filter = filter_values[filter_row.get_selected()]
+            # The list fields are shared with parent.settings (shallow-copy in
+            # __init__), so one write per list reaches both.
             self.settings.extra_locations[idx] = new_path
-            self.parent_window.settings.extra_locations[idx] = new_path
-            # Pad names list to match index length.
             while len(self.settings.extra_location_names) <= idx:
                 self.settings.extra_location_names.append("")
-            while len(self.parent_window.settings.extra_location_names) <= idx:
-                self.parent_window.settings.extra_location_names.append("")
             self.settings.extra_location_names[idx] = new_name
-            self.parent_window.settings.extra_location_names[idx] = new_name
+            while len(self.settings.extra_location_no_inherit) <= idx:
+                self.settings.extra_location_no_inherit.append(False)
+            self.settings.extra_location_no_inherit[idx] = new_no_inherit
+            while len(self.settings.extra_location_media_filter) <= idx:
+                self.settings.extra_location_media_filter.append("both")
+            self.settings.extra_location_media_filter[idx] = new_media_filter
             self.parent_window.settings.save()
             # Refresh the row (title falls back to basename if name is empty)
             display_title = new_name or Path(new_path).name or new_path

@@ -69,14 +69,18 @@ def test_database_delete_path_is_category_scoped(tmp_path: Path) -> None:
     shared = tmp_path / "shared.jpg"
     shared.write_bytes(b"img")
 
+    # "pictures" is now a virtual aggregator (Overview) and rejects writes,
+    # so the second insertion uses another real category. The test is about
+    # (path, category) compound-key behaviour — the specific pair doesn't
+    # matter as long as both are real, indexable categories.
     db.upsert_media(path=shared, category="photos", media_type="image", folder="/", thumb_path=None)
-    db.upsert_media(path=shared, category="pictures", media_type="image", folder="/", thumb_path=None)
+    db.upsert_media(path=shared, category="screenshots", media_type="image", folder="/", thumb_path=None)
     db.commit()
 
     db.delete_path(str(shared), category="photos")
 
     assert db.list_media("photos") == []
-    assert [item.name for item in db.list_media("pictures")] == ["shared.jpg"]
+    assert [item.name for item in db.list_media("screenshots")] == ["shared.jpg"]
 
 
 def test_database_get_media_by_path_is_category_scoped(tmp_path: Path) -> None:
@@ -85,13 +89,13 @@ def test_database_get_media_by_path_is_category_scoped(tmp_path: Path) -> None:
     shared.write_bytes(b"img")
 
     db.upsert_media(path=shared, category="photos", media_type="image", folder="/", thumb_path="t1.jpg")
-    db.upsert_media(path=shared, category="pictures", media_type="image", folder="/", thumb_path="t2.jpg")
+    db.upsert_media(path=shared, category="screenshots", media_type="image", folder="/", thumb_path="t2.jpg")
     db.commit()
 
-    item = db.get_media_by_path(str(shared), category="pictures")
+    item = db.get_media_by_path(str(shared), category="screenshots")
     assert item is not None
     assert item.thumb_path == "t2.jpg"
-    assert item.category == "pictures"
+    assert item.category == "screenshots"
 
 
 def test_scanner_indexes_media_recursively_and_ignores_non_media(tmp_path: Path) -> None:
@@ -104,14 +108,25 @@ def test_scanner_indexes_media_recursively_and_ignores_non_media(tmp_path: Path)
     (nested / "notes.txt").write_bytes(b"text")
 
     scanner = MediaScanner(db, FakeThumbnailer())
-    scanner.scan([("pictures", "Pictures", str(root))])
+    # Use "screenshots" rather than "pictures": the latter is now a virtual
+    # aggregator and is intentionally not scannable as its own category.
+    scanner.scan([("screenshots", "Screenshots", str(root))])
 
-    all_items = db.list_media("pictures", "name")
-    assert [item.name for item in all_items] == ["clip.mp4", "cover.jpg"]
-    assert all_items[0].folder == "Camera/May"
-    assert all_items[0].media_type == "video"
-    assert all_items[0].thumb_path == "thumb://video/clip.mp4"
-    assert all_items[1].folder == "/"
+    # Image categories show only images — videos surface via the dedicated
+    # "videos" aggregate category, regardless of which root indexed them.
+    images = db.list_media("screenshots", "name")
+    assert [item.name for item in images] == ["cover.jpg"]
+    assert images[0].folder == "/"
+    assert images[0].media_type == "image"
+
+    videos = db.list_media("videos", "name")
+    assert [item.name for item in videos] == ["clip.mp4"]
+    assert videos[0].folder == "Camera/May"
+    assert videos[0].media_type == "video"
+    assert videos[0].thumb_path == "thumb://video/clip.mp4"
+
+    # notes.txt was correctly ignored — neither category sees it.
+    assert "notes.txt" not in {item.name for item in images + videos}
 
 
 def test_scanner_can_use_database_from_background_thread(tmp_path: Path) -> None:
@@ -124,7 +139,9 @@ def test_scanner_can_use_database_from_background_thread(tmp_path: Path) -> None
 
     def run_scan() -> None:
         try:
-            scanner.scan([("pictures", "Pictures", str(root))])
+            # Avoid "pictures" — that key now resolves to the Overview
+            # aggregator and is not scannable as its own category.
+            scanner.scan([("screenshots", "Screenshots", str(root))])
         except BaseException as exc:
             error.append(exc)
 
@@ -134,7 +151,7 @@ def test_scanner_can_use_database_from_background_thread(tmp_path: Path) -> None
 
     assert not thread.is_alive()
     assert error == []
-    assert [item.name for item in db.list_media("pictures")] == ["background.jpg"]
+    assert [item.name for item in db.list_media("screenshots")] == ["background.jpg"]
 
 
 def test_scanner_prunes_removed_files_only_for_scanned_existing_categories(tmp_path: Path) -> None:
@@ -269,17 +286,21 @@ def test_gallery_folder_navigation_uses_swipe_without_visible_back_button() -> N
     assert "self.back_button.set_visible(False)" in source
 
 
-def test_nextcloud_folder_open_only_syncs_folder_thumbnails() -> None:
+def test_nextcloud_folder_open_uses_on_demand_thumbnails() -> None:
+    """Opening an NC folder must not trigger a bulk thumbnail download —
+    tiles request their own thumbnail lazily when they scroll into view.
+    Bulk sync (scan_nc_structure) is reserved for the initial structure scan,
+    not per-folder navigation."""
     source = Path("yaga/app.py").read_text(encoding="utf-8")
-    folder_sync_body = source.split("def _nc_folder_sync_bg", 1)[1].split("def _queue_nc_thumb_update", 1)[0]
     grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
 
-    assert "load_nc_folder_thumbs" in folder_sync_body
-    assert "scan_nc_structure" not in folder_sync_body
-    assert "_nc_folder_sync_generation" in source
-    assert "MediaRow.from_media(updated, row.selected)" in grid_source
-    assert "return True" in grid_source
-    assert "get_media_by_path" in source
+    # Public entry point the grid calls when it needs a tile's thumbnail.
+    assert "def request_nc_thumbnail" in source
+    # Worker pool fans out HTTPS thumbnail fetches in parallel.
+    assert "_nc_thumb_worker" in source
+    # Grid forwards tile-bind events to the requester rather than bulk-loading.
+    assert 'getattr(self.owner, "request_nc_thumbnail"' in grid_source
+    # When a fetched thumbnail comes back, it updates the row in place.
     assert "update_folder_thumb" in grid_source
 
 
@@ -316,7 +337,11 @@ def test_viewer_has_close_header_but_no_navigation_buttons() -> None:
     assert 'connect("end", self._on_swipe)' not in viewer_source
     assert 'self.drag_gesture.connect("drag-end", self._on_drag_end)' in viewer_source
     assert 'self.zoom_gesture.connect("scale-changed", self._on_zoom_scale_changed)' in viewer_source
-    assert 'self.click_gesture.connect("pressed", self._on_viewer_pressed)' in viewer_source
+    # The click gesture splits into two phases: "pressed" stamps the start
+    # position so a tap-vs-drag decision can be made later, and "released"
+    # is the actual click handler that dispatches single-/double-click intent.
+    assert 'self.click_gesture.connect("pressed", self._on_viewer_press_begin)' in viewer_source
+    assert 'self.click_gesture.connect("released", self._on_viewer_pressed)' in viewer_source
     assert "def _navigate_from_horizontal_motion" in viewer_source
     assert "abs(x) <= abs(y) * 1.8" in viewer_source
 
@@ -354,9 +379,15 @@ def test_navigation_uses_spinner_broken_icon_and_pull_refresh() -> None:
 
     assert "DEBUG_LOG_PATH" in config_source
     assert "RotatingFileHandler(DEBUG_LOG_PATH" in app_source
-    assert "header.pack_start(self.refresh_button)" not in app_source
-    assert "Gtk.EventControllerScrollFlags.VERTICAL" in app_source
-    assert "def _on_pull_refresh_scroll" in app_source
+    # Refresh icon now lives in the titlebar (top-left) so desktop users
+    # have a discoverable refresh action; mobile keeps the gesture below.
+    assert "header.pack_start(self.refresh_button)" in app_source
+    # Pull-to-refresh moved from "any over-pull" (EventControllerScroll +
+    # edge-overshot) to a proper GestureDrag with a release-threshold so
+    # the list visibly wobbles before firing the refresh.
+    assert "Gtk.GestureDrag.new()" in app_source
+    assert "def _on_pull_drag_update" in app_source
+    assert "def _on_pull_drag_end" in app_source
     assert "Gtk.Spinner()" in app_source
     assert "network-error-symbolic" in app_source
     assert "set_pixel_size(22)" in app_source
@@ -374,11 +405,17 @@ def test_gallery_supports_date_group_sorting_headers() -> None:
     app_source = Path("yaga/app.py").read_text(encoding="utf-8")
     grid_source = Path("yaga/gallery_grid.py").read_text(encoding="utf-8")
 
-    assert '("date", "Date", "view-calendar-symbolic")' in app_source
+    # "date" is a first-class sort key in the dropdown, paired with the
+    # ascending/descending direction button via _SORT_TO_INTERNAL.
+    assert '"date"' in app_source
+    assert '"Date"' in app_source
+    assert '_SORT_KEYS' in app_source
+    # Date sort produces grouped headers, emitted month-by-month.
     assert "def _render_date_groups" in app_source
-    assert "def _date_group_label" in app_source
-    assert 'order = ["day", "week", "month", "year"]' in app_source
-    assert "self.gallery_grid.append_header(header)" in app_source
+    assert "def _append_date_grouped" in app_source
+    assert "def _month_header_markup" in app_source
+    # Headers flow through the gallery grid's append_header path.
+    assert "self.gallery_grid.append_header(" in app_source
     assert "def append_header" in grid_source
     assert "class MediaRow" in grid_source
     assert "header_text" in grid_source
@@ -414,13 +451,14 @@ def test_viewer_delete_uses_confirmation_and_cleans_index_and_thumbnail() -> Non
 
 def test_editor_is_split_out_of_app_module() -> None:
     app_source = Path("yaga/app.py").read_text(encoding="utf-8")
-    editor_source = Path("yaga/editor.py").read_text(encoding="utf-8")
+    # The editor became a package; the GTK widget lives in editor/view.py.
+    view_source = Path("yaga/editor/view.py").read_text(encoding="utf-8")
 
     assert "from .editor import EditorView, PILImage, _PIL_OK" not in app_source
     assert "class EditorView" not in app_source
-    assert "class EditorView" in editor_source
-    assert "def __init__(self, item: MediaItem, translate=None)" in editor_source
-    assert "def _(self, text: str) -> str" in editor_source
+    assert "class EditorView" in view_source
+    assert "def __init__(self, item: MediaItem, translate=None)" in view_source
+    assert "def _(self, text: str) -> str" in view_source
 
 
 def test_editor_frames_are_decorative_not_plain_color_bands() -> None:
@@ -438,14 +476,16 @@ def test_editor_frames_are_decorative_not_plain_color_bands() -> None:
     ]
     assert len(set(edge_pixels)) > 4
 
-    source = Path("yaga/editor.py").read_text(encoding="utf-8")
+    # Frame decorators live in editor/frames.py after the split.
+    source = Path("yaga/editor/frames.py").read_text(encoding="utf-8")
     assert "_decorate_christmas" in source
     assert "_decorate_winter" in source
     assert len(_FRAME_THEMES) >= 8
 
 
 def test_editor_has_resettable_sliders_color_picker_and_multiple_stickers() -> None:
-    source = Path("yaga/editor.py").read_text(encoding="utf-8")
+    # Editor UI now lives in editor/view.py.
+    source = Path("yaga/editor/view.py").read_text(encoding="utf-8")
 
     assert 'Gtk.Button.new_from_icon_name("edit-undo-symbolic")' in source
     assert "def _reset_slider" in source

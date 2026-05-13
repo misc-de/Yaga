@@ -5,21 +5,42 @@ import base64
 import email.utils
 import http.client
 import logging
+import os
 import ssl
 import time
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
-from xml.etree import ElementTree
+
+# PROPFIND responses come from a network peer, so we prefer defusedxml's
+# hardened parser (no DTD, no entity expansion → safe against billion-laughs
+# DoS via a malicious or MitM'd server response). Stdlib ElementTree is the
+# fallback for users on bare clones without the optional package; we log
+# once on first parse so the operator notices.
+try:
+    from defusedxml.ElementTree import fromstring as _xml_fromstring
+    from defusedxml.ElementTree import ParseError as _xml_ParseError
+    _XML_HARDENED = True
+except ImportError:
+    from xml.etree.ElementTree import fromstring as _xml_fromstring  # type: ignore[assignment]
+    from xml.etree.ElementTree import ParseError as _xml_ParseError  # type: ignore[assignment]
+    _XML_HARDENED = False
 
 from . import VERSION
 from .config import CACHE_DIR, THUMB_DIR
 
 USER_AGENT = f"Yaga/{VERSION}"
 LOGGER = logging.getLogger(__name__)
+if not _XML_HARDENED:
+    LOGGER.warning(
+        "defusedxml not installed — falling back to xml.etree for PROPFIND. "
+        "Install 'defusedxml' to harden against XML DoS / entity attacks.",
+    )
 
 # Local directories for cached full-res files and thumbnails
 _NC_CACHE = CACHE_DIR / "nextcloud"
 _NC_THUMB = THUMB_DIR / "nextcloud"
+_CHUNK_SIZE = 1024 * 1024
+_MAX_THUMB_BYTES = 10 * 1024 * 1024
 
 # Prefix stored in DB to identify nextcloud paths
 NC_PATH_PREFIX = "nextcloud://"
@@ -60,7 +81,12 @@ class NextcloudClient:
     # Low-level HTTP
     # ------------------------------------------------------------------
 
-    def _conn(self, timeout: float = 30.0) -> http.client.HTTPConnection:
+    def _conn(self, timeout: float = 12.0) -> http.client.HTTPConnection:
+        # 12 s default: enough for a slow but live server, short enough that
+        # a stalled connection fails fast and the user isn't staring at a
+        # spinner for the previous 30 s default. The scan-thread caller
+        # treats the timeout exception as "sync failed, try again" without
+        # blocking the UI further.
         if self.use_ssl:
             ctx = ssl.create_default_context()
             return http.client.HTTPSConnection(self.host, context=ctx, timeout=timeout)
@@ -91,6 +117,56 @@ class NextcloudClient:
         if extra:
             h.update(extra)
         return h
+
+    def _temp_path_for(self, dest: Path) -> Path:
+        return dest.with_name(f"{dest.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+
+    def _write_response_atomic(
+        self,
+        resp: http.client.HTTPResponse,
+        dest: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> bool:
+        """Stream an HTTP response to a sibling temp file and atomically publish it."""
+        length = resp.getheader("Content-Length")
+        if max_bytes is not None and length is not None:
+            try:
+                if int(length) > max_bytes:
+                    LOGGER.warning("Refusing oversized Nextcloud response for %s (%s bytes)", dest, length)
+                    return False
+            except ValueError:
+                pass
+
+        tmp = self._temp_path_for(dest)
+        written = 0
+        try:
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = resp.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        LOGGER.warning("Refusing oversized Nextcloud response for %s", dest)
+                        return False
+                    fh.write(chunk)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, dest)
+            return True
+        except Exception:
+            LOGGER.debug("Could not write Nextcloud cache file %s", dest, exc_info=True)
+            return False
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # WebDAV PROPFIND
@@ -141,8 +217,8 @@ class NextcloudClient:
     def _parse_propfind(self, data: bytes, base_path: str) -> list[dict]:
         ns = {"D": "DAV:"}
         try:
-            root = ElementTree.fromstring(data)
-        except ElementTree.ParseError:
+            root = _xml_fromstring(data)
+        except _xml_ParseError:
             return []
         results: list[dict] = []
         for response in root.findall("D:response", ns):
@@ -207,8 +283,10 @@ class NextcloudClient:
                 conn.request("GET", thumb_url, headers=self._headers())
                 resp = conn.getresponse()
                 if resp.status == 200:
-                    dest.write_bytes(resp.read())
-                    return str(dest)
+                    if self._write_response_atomic(resp, dest, max_bytes=_MAX_THUMB_BYTES):
+                        return str(dest)
+                    self._drop_persistent_conn()
+                    return None
                 # Drain so the connection can be reused.
                 resp.read()
                 LOGGER.debug("Nextcloud thumbnail HTTP %s for %s", resp.status, dav_path)
@@ -245,8 +323,9 @@ class NextcloudClient:
             )
             resp = conn.getresponse()
             if resp.status == 200:
-                dest.write_bytes(resp.read())
-                return str(dest)
+                if self._write_response_atomic(resp, dest):
+                    return str(dest)
+                return None
             LOGGER.debug("Nextcloud file HTTP %s for %s", resp.status, dav_path)
         except Exception:
             LOGGER.debug("Nextcloud file download failed for %s", dav_path, exc_info=True)
@@ -264,22 +343,22 @@ class NextcloudClient:
             LOGGER.error("Local file does not exist: %s", local_path)
             return False
         
-        try:
-            file_content = local_path.read_bytes()
-        except Exception as exc:
-            LOGGER.error("Failed to read local file %s: %s", local_path, exc)
-            return False
-        
         conn = self._conn()
         try:
-            headers = self._headers()
-            headers["Content-Type"] = "application/octet-stream"
-            conn.request(
-                "PUT",
-                quote(dav_path, safe="/:@!$&'()*+,;="),
-                body=file_content,
-                headers=headers,
-            )
+            stat = local_path.stat()
+            conn.putrequest("PUT", quote(dav_path, safe="/:@!$&'()*+,;="))
+            for key, value in self._headers({
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(stat.st_size),
+            }).items():
+                conn.putheader(key, value)
+            conn.endheaders()
+            with open(local_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
             resp = conn.getresponse()
             resp.read()  # consume response body
             
@@ -315,4 +394,3 @@ class NextcloudClient:
             return False
         finally:
             conn.close()
-
