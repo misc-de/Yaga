@@ -852,7 +852,15 @@ class GalleryGrid(Gtk.Overlay):
             if requester is not None:
                 requester(item.path)
         else:
-            single_pic.set_filename(item.path)
+            if item.is_video:
+                single_pic.set_paintable(
+                    icon_theme.lookup_icon(
+                        "video-x-generic-symbolic", None, 96, 1,
+                        Gtk.TextDirection.NONE, Gtk.IconLookupFlags.NONE,
+                    )
+                )
+            else:
+                single_pic.set_filename(item.path)
         badge.set_visible(item.is_video and not self.owner._selection_mode)
         folder_label.set_visible(False)
         if self.owner._selection_mode:
