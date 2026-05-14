@@ -2780,9 +2780,15 @@ class GalleryWindow(Adw.ApplicationWindow):
         # so min/max-width here would create a measurement feedback loop.
         # (GTK4 CSS has no max-height for generic widgets, so we rely on
         # the tile's lack of vexpand to keep it at min-height.)
+        icon_size = max(24, cell_size // 2)
         self._tile_css.load_from_data(
             f""".gallery-tile {{
                 min-height: {cell_size}px;
+            }}
+            .tile-placeholder {{
+                -gtk-icon-size: {icon_size}px;
+                min-width: {icon_size}px;
+                min-height: {icon_size}px;
             }}""".encode()
         )
 

@@ -667,11 +667,18 @@ class GalleryGrid(Gtk.Overlay):
         check.add_css_class("sel-check")
         check.set_visible(False)
 
+        placeholder_icon = Gtk.Image()
+        placeholder_icon.add_css_class("tile-placeholder")
+        placeholder_icon.set_halign(Gtk.Align.CENTER)
+        placeholder_icon.set_valign(Gtk.Align.CENTER)
+        placeholder_icon.set_visible(False)
+
         overlay = Gtk.Overlay()
         overlay.set_hexpand(True)
         overlay.set_vexpand(True)
         overlay.set_child(single_pic)
         overlay.add_overlay(pic_grid)
+        overlay.add_overlay(placeholder_icon)
         overlay.add_overlay(badge)
         overlay.add_overlay(folder_label)
         overlay.add_overlay(check)
@@ -683,13 +690,14 @@ class GalleryGrid(Gtk.Overlay):
         button.set_vexpand(False)
         button.set_child(overlay)
 
-        button._single_pic = single_pic        # type: ignore[attr-defined]
-        button._preview_pics = preview_pics    # type: ignore[attr-defined]
-        button._pic_grid = pic_grid            # type: ignore[attr-defined]
-        button._badge = badge                  # type: ignore[attr-defined]
-        button._folder_label = folder_label    # type: ignore[attr-defined]
-        button._check = check                  # type: ignore[attr-defined]
-        button._tile_index = tile_index        # type: ignore[attr-defined]
+        button._single_pic = single_pic            # type: ignore[attr-defined]
+        button._placeholder_icon = placeholder_icon  # type: ignore[attr-defined]
+        button._preview_pics = preview_pics        # type: ignore[attr-defined]
+        button._pic_grid = pic_grid                # type: ignore[attr-defined]
+        button._badge = badge                      # type: ignore[attr-defined]
+        button._folder_label = folder_label        # type: ignore[attr-defined]
+        button._check = check                      # type: ignore[attr-defined]
+        button._tile_index = tile_index            # type: ignore[attr-defined]
         button._current_item: MediaRow | None = None  # type: ignore[attr-defined]
 
         button.connect("clicked", self._on_tile_clicked, list_item)
@@ -794,15 +802,29 @@ class GalleryGrid(Gtk.Overlay):
         button.set_can_target(True)
         button.remove_css_class("empty")
         single_pic: Gtk.Picture = button._single_pic
+        placeholder_icon: Gtk.Image = button._placeholder_icon
         preview_pics: list[Gtk.Picture] = button._preview_pics
         pic_grid: Gtk.Widget = button._pic_grid
         badge: Gtk.Image = button._badge
         folder_label: Gtk.Label = button._folder_label
         check: Gtk.Image = button._check
 
+        def _show_placeholder(icon_name: str) -> None:
+            single_pic.set_paintable(None)
+            single_pic.set_visible(False)
+            placeholder_icon.set_from_icon_name(icon_name)
+            placeholder_icon.set_visible(True)
+
+        def _show_thumb(path: str) -> None:
+            placeholder_icon.set_visible(False)
+            single_pic.set_paintable(None)
+            single_pic.set_visible(True)
+            single_pic.set_filename(path)
+
         if row.is_folder:
             valid_thumbs = [t for t in row.folder_thumbs if self._thumb_exists(t)]
             if len(valid_thumbs) >= 2:
+                placeholder_icon.set_visible(False)
                 single_pic.set_visible(False)
                 pic_grid.set_visible(True)
                 for i, picture in enumerate(preview_pics):
@@ -813,17 +835,11 @@ class GalleryGrid(Gtk.Overlay):
                         picture.set_paintable(None)
                         picture.set_visible(False)
             else:
-                single_pic.set_visible(True)
                 pic_grid.set_visible(False)
                 if valid_thumbs:
-                    single_pic.set_filename(valid_thumbs[0])
+                    _show_thumb(valid_thumbs[0])
                 else:
-                    single_pic.set_paintable(
-                        icon_theme.lookup_icon(
-                            "folder-pictures-symbolic", None, 96, 1,
-                            Gtk.TextDirection.NONE, Gtk.IconLookupFlags.NONE,
-                        )
-                    )
+                    _show_placeholder("folder-pictures-symbolic")
             label = row.folder_path.rsplit("/", 1)[-1] if row.folder_path != "/" else "/"
             folder_label.set_label(label)
             folder_label.set_halign(Gtk.Align.FILL)
@@ -836,31 +852,19 @@ class GalleryGrid(Gtk.Overlay):
 
         item = row.media_item
         assert item is not None
-        single_pic.set_visible(True)
         pic_grid.set_visible(False)
         if item.thumb_path and self._thumb_exists(item.thumb_path):
-            single_pic.set_filename(item.thumb_path)
+            _show_thumb(item.thumb_path)
         elif is_nc_path(item.path):
-            single_pic.set_paintable(
-                icon_theme.lookup_icon(
-                    "image-x-generic-symbolic", None, 96, 1,
-                    Gtk.TextDirection.NONE, Gtk.IconLookupFlags.NONE,
-                )
-            )
+            _show_placeholder("image-x-generic-symbolic")
             # Fetch the NC thumbnail in the background; gallery is updated when it arrives.
             requester = getattr(self.owner, "request_nc_thumbnail", None)
             if requester is not None:
                 requester(item.path)
+        elif item.is_video:
+            _show_placeholder("video-x-generic-symbolic")
         else:
-            if item.is_video:
-                single_pic.set_paintable(
-                    icon_theme.lookup_icon(
-                        "video-x-generic-symbolic", None, 96, 1,
-                        Gtk.TextDirection.NONE, Gtk.IconLookupFlags.NONE,
-                    )
-                )
-            else:
-                single_pic.set_filename(item.path)
+            _show_thumb(item.path)
         badge.set_visible(item.is_video and not self.owner._selection_mode)
         folder_label.set_visible(False)
         if self.owner._selection_mode:
@@ -882,6 +886,7 @@ class GalleryGrid(Gtk.Overlay):
         stack = list_item.get_child()
         for btn in stack._tile_buttons:
             btn._single_pic.set_paintable(None)
+            btn._placeholder_icon.set_visible(False)
             btn._current_item = None
             for picture in btn._preview_pics:
                 picture.set_paintable(None)
