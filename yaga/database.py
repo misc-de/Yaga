@@ -138,6 +138,47 @@ CREATE INDEX IF NOT EXISTS idx_media_type_mtime_name
 PRAGMA user_version = 6;
 """
 
+# v7: ensure face-recognition tables exist for DBs that were at version >= 3
+# before this feature landed (i.e. DBs that were running main and never got
+# the v3 face-recognition migration). All statements use IF NOT EXISTS so
+# running this on a DB that already has the tables is a safe no-op.
+_MIGRATION_V7 = """
+CREATE TABLE IF NOT EXISTS persons (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    cover_face_id INTEGER,
+    created_at REAL NOT NULL,
+    hidden INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS faces (
+    id INTEGER PRIMARY KEY,
+    media_path TEXT NOT NULL,
+    media_category TEXT NOT NULL,
+    bbox TEXT NOT NULL,
+    landmarks TEXT,
+    embedding BLOB NOT NULL,
+    quality REAL NOT NULL,
+    thumb_path TEXT,
+    person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+    cluster_id INTEGER,
+    detected_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_faces_media ON faces(media_path, media_category);
+CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
+CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
+
+CREATE TABLE IF NOT EXISTS face_index_state (
+    media_path TEXT NOT NULL,
+    media_category TEXT NOT NULL,
+    media_mtime REAL NOT NULL,
+    detected_version INTEGER NOT NULL,
+    PRIMARY KEY (media_path, media_category)
+);
+
+PRAGMA user_version = 7;
+"""
+
 
 class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
@@ -263,6 +304,12 @@ class Database:
                 self.conn.commit()
             except sqlite3.OperationalError as exc:
                 LOGGER.warning("Could not create media performance indexes: %s", exc)
+        if version < 7:
+            try:
+                self.conn.executescript(_MIGRATION_V7)
+                self.conn.commit()
+            except sqlite3.OperationalError as exc:
+                LOGGER.warning("Could not create face-recognition tables: %s", exc)
 
     def upsert_media(self, *, path: Path, category: str, media_type: str, folder: str, thumb_path: str | None) -> None:
         stat = path.stat()
